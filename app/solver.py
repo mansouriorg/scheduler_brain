@@ -2,10 +2,9 @@ from ortools.sat.python import cp_model
 from .models import ScheduleRequest, ScheduleResponse, ScheduledClass
 
 def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
-    # --- PRE-CHECK: PROFESSOR WORKLOAD (Constraint 8) ---
-    # We check this BEFORE running the AI. If a professor is assigned 50 hours 
-    # but their max is 40, it is physically impossible. Don't even try to solve it.
+    # --- PRE-CHECK: PROFESSOR WORKLOAD ---
     prof_hours = {}
+    prof_dict = {p.id: p for p in data.professors}
     for c in data.classes:
         if c.professorId:
             prof_hours[c.professorId] = prof_hours.get(c.professorId, 0) + (c.durationMinutes / 60.0)
@@ -13,9 +12,8 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
     for p in data.professors:
         if prof_hours.get(p.id, 0) > p.maxHoursPerWeek:
             return ScheduleResponse(
-                success=False,
-                scheduledClasses=[],
-                message=f"Impossible Setup: Professor {p.name} is assigned {prof_hours.get(p.id, 0)} hours of classes, but their max workload is {p.maxHoursPerWeek}."
+                success=False, scheduledClasses=[],
+                message=f"Impossible Setup: Professor {p.name} is assigned {prof_hours.get(p.id, 0)} hours, but their max is {p.maxHoursPerWeek}."
             )
 
     # 1. Initialize the Constraint Programming Model
@@ -34,31 +32,35 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
     num_slots = len(SLOTS)
 
     PREF_SLOTS = {
-        'MORNING': [0, 1],
-        'AFTERNOON': [2, 3],
-        'EVENING': [4],
-        'NO_PREFERENCE': [0, 1, 2, 3, 4]
+        'MORNING': [0, 1], 'AFTERNOON': [2, 3], 'EVENING': [4], 'NO_PREFERENCE': [0, 1, 2, 3, 4]
     }
 
-    # --- CREATE VARIABLES ---
+    # --- CREATE VARIABLES (With Capacity & Equipment Filtering!) ---
     x = {}
     for c in data.classes:
         for r in data.rooms:
-            # OPTIMIZATION + CONSTRAINT 7 (ROOM CAPACITY):
-            # We ONLY allow the AI to consider this room if the type matches AND the cohort fits!
+            # OPTIMIZATION: Check Room Type AND Capacity
             if c.requiresRoomType == r.roomType and c.cohortHeadcount <= r.capacity:
-                for d in range(num_days):
-                    for t in range(num_slots):
-                        x[(c.id, r.id, d, t)] = model.NewBoolVar(f'c_{c.id}_r_{r.id}_d_{d}_t_{t}')
+                # OPTIMIZATION: Check that the room has ALL required equipment
+                has_equipment = all(req in r.equipment for req in c.requiredEquipment)
+                if has_equipment:
+                    for d in range(num_days):
+                        for t in range(num_slots):
+                            x[(c.id, r.id, d, t)] = model.NewBoolVar(f'c_{c.id}_r_{r.id}_d_{d}_t_{t}')
 
     # --- HELPER DICTIONARIES ---
     prof_classes = {}
     cohort_classes = {}
+    cohort_course_groups = {}
+    student_classes = {} # Tracking individual students!
+
     for c in data.classes:
-        if c.professorId:
-            prof_classes.setdefault(c.professorId, []).append(c)
-        if c.cohortId:
+        if c.professorId: prof_classes.setdefault(c.professorId, []).append(c)
+        if c.cohortId: 
             cohort_classes.setdefault(c.cohortId, []).append(c)
+            cohort_course_groups.setdefault((c.cohortId, c.courseCode), []).append(c)
+        for s_id in c.studentIds:
+            student_classes.setdefault(s_id, []).append(c)
 
     # --- CONSTRAINT 1: Every class must happen EXACTLY ONCE ---
     for c in data.classes:
@@ -66,135 +68,141 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
         if not valid_assignments:
             return ScheduleResponse(
                 success=False, scheduledClasses=[], 
-                message=f"Impossible: No valid room found for class {c.courseCode}. Check Room Types AND Room Capacities!"
+                message=f"Impossible: No valid room found for class {c.courseCode}. Check Room Types, Capacities, AND Equipment!"
             )
         model.AddExactlyOne(valid_assignments)
 
-    # --- CONSTRAINT 2: Prevent Room Double-Booking ---
+    # --- CONSTRAINT 2 & 3: Prevent Double-Booking (Rooms & Profs) ---
     for r in data.rooms:
         for d in range(num_days):
             for t in range(num_slots):
                 classes_in_room = [x[(c.id, r.id, d, t)] for c in data.classes if (c.id, r.id, d, t) in x]
-                if classes_in_room:
-                    model.AddAtMostOne(classes_in_room)
+                if classes_in_room: model.AddAtMostOne(classes_in_room)
 
-    # --- CONSTRAINT 3: Prevent Professor Double-Booking ---
     for prof_id, classes in prof_classes.items():
         for d in range(num_days):
             for t in range(num_slots):
                 prof_assignments = [x[(c.id, r.id, d, t)] for c in classes for r in data.rooms if (c.id, r.id, d, t) in x]
-                if prof_assignments:
-                    model.AddAtMostOne(prof_assignments)
+                if prof_assignments: model.AddAtMostOne(prof_assignments)
 
-    # --- CONSTRAINT 4: Prevent Cohort Double-Booking ---
-    for cohort_id, classes in cohort_classes.items():
-        for d in range(num_days):
-            for t in range(num_slots):
-                cohort_assignments = [x[(c.id, r.id, d, t)] for c in classes for r in data.rooms if (c.id, r.id, d, t) in x]
-                if cohort_assignments:
-                    model.AddAtMostOne(cohort_assignments)
+    # --- CONSTRAINT 4: Prevent STUDENT Double-Booking (Cross-Cohort Matrix!) ---
+    for s_id, classes in student_classes.items():
+        if len(classes) > 1: 
+            for d in range(num_days):
+                for t in range(num_slots):
+                    student_assignments = [x[(c.id, r.id, d, t)] for c in classes for r in data.rooms if (c.id, r.id, d, t) in x]
+                    if len(student_assignments) > 1:
+                        model.AddAtMostOne(student_assignments)
 
-    # --- CONSTRAINT 5: Spaced Learning ---
-    cohort_course_groups = {}
-    for c in data.classes:
-        if c.cohortId:
-            cohort_course_groups.setdefault((c.cohortId, c.courseCode), []).append(c)
-
+    # --- CONSTRAINT 5: Spaced Learning (Max 1 session per course per day) ---
     for (cohort_id, course_code), classes in cohort_course_groups.items():
         if len(classes) > 1:
             for d in range(num_days):
                 course_sessions = [x[(c.id, r.id, d, t)] for c in classes for r in data.rooms for t in range(num_slots) if (c.id, r.id, d, t) in x]
-                if course_sessions:
-                    model.AddAtMostOne(course_sessions)
+                if course_sessions: model.AddAtMostOne(course_sessions)
 
-    # --- CONSTRAINT 6: Professor Time Preferences ---
-    prof_prefs = {p.id: p.timePreference for p in data.professors}
+    # --- CONSTRAINT 6: Professor Time Preferences AND Days Off ---
     for c in data.classes:
-        if c.professorId and c.professorId in prof_prefs:
-            valid_slots = PREF_SLOTS.get(prof_prefs[c.professorId], [0, 1, 2, 3, 4])
+        if c.professorId and c.professorId in prof_dict:
+            prof = prof_dict[c.professorId]
+            valid_slots = PREF_SLOTS.get(prof.timePreference, [0, 1, 2, 3, 4])
+            
             for r in data.rooms:
                 for d in range(num_days):
+                    is_day_off = DAYS[d] in prof.unavailableDays
                     for t in range(num_slots):
-                        if t not in valid_slots and (c.id, r.id, d, t) in x:
-                            model.Add(x[(c.id, r.id, d, t)] == 0)
+                        if (c.id, r.id, d, t) in x:
+                            if is_day_off or t not in valid_slots:
+                                model.Add(x[(c.id, r.id, d, t)] == 0)
 
-    # --- CONSTRAINT 9: Fatigue Prevention (Max 2 classes in any 3 consecutive slots) ---
-    for cohort_id, classes in cohort_classes.items():
-        for d in range(num_days):
-            for w_start in range(num_slots - 2): # Sliding window of 3
-                window = [w_start, w_start + 1, w_start + 2]
-                window_vars = [x[(c.id, r.id, d, t)] for t in window for c in classes for r in data.rooms if (c.id, r.id, d, t) in x]
-                if window_vars:
-                    model.Add(sum(window_vars) <= 2)
+    # --- CONSTRAINT 7: Sequencing (Theory BEFORE Practice) ---
+    for (cohort_id, course_code), classes in cohort_course_groups.items():
+        lectures = [c for c in classes if c.componentType == 'LECTURE']
+        practicals = [c for c in classes if c.componentType in ['TD', 'TP', 'WORKSHOP']]
+        
+        if lectures and practicals:
+            for lec in lectures:
+                for prac in practicals:
+                    lec_time_index = sum((d * 10 + t) * x[(lec.id, r.id, d, t)] for r in data.rooms for d in range(num_days) for t in range(num_slots) if (lec.id, r.id, d, t) in x)
+                    prac_time_index = sum((d * 10 + t) * x[(prac.id, r.id, d, t)] for r in data.rooms for d in range(num_days) for t in range(num_slots) if (prac.id, r.id, d, t) in x)
+                    model.Add(lec_time_index < prac_time_index)
 
-    for prof_id, classes in prof_classes.items():
-        for d in range(num_days):
-            for w_start in range(num_slots - 2):
-                window = [w_start, w_start + 1, w_start + 2]
-                window_vars = [x[(c.id, r.id, d, t)] for t in window for c in classes for r in data.rooms if (c.id, r.id, d, t) in x]
-                if window_vars:
-                    model.Add(sum(window_vars) <= 2)
+    # --- CONSTRAINT 8: Fatigue Prevention (Max 2 classes in 3 consecutive slots) ---
+    for entity_classes in [cohort_classes, prof_classes]:
+        for entity_id, classes in entity_classes.items():
+            for d in range(num_days):
+                for w_start in range(num_slots - 2):
+                    window = [w_start, w_start + 1, w_start + 2]
+                    window_vars = [x[(c.id, r.id, d, t)] for t in window for c in classes for r in data.rooms if (c.id, r.id, d, t) in x]
+                    if window_vars: model.Add(sum(window_vars) <= 2)
 
-    # --- CONSTRAINT 10: Campus Travel Times (No teleporting!) ---
+    # --- CONSTRAINT 9: Campus Travel Times ---
     campuses = {r.campusId for r in data.rooms}
     for cohort_id, classes in cohort_classes.items():
         for d in range(num_days):
-            for t in range(num_slots - 1): # Look at t and t+1
+            for t in range(num_slots - 1):
                 for campus_a in campuses:
                     for campus_b in campuses:
                         if campus_a != campus_b:
-                            # If at campus A at time t, cannot be at campus B at time t+1
                             at_a = [x[(c.id, r.id, d, t)] for c in classes for r in data.rooms if r.campusId == campus_a and (c.id, r.id, d, t) in x]
                             at_b = [x[(c.id, r.id, d, t+1)] for c in classes for r in data.rooms if r.campusId == campus_b and (c.id, r.id, d, t+1) in x]
                             if at_a and at_b:
                                 model.Add(sum(at_a) + sum(at_b) <= 1)
 
-    # --- CONSTRAINT 11: Minimize Gaps (Swiss Cheese Schedules) ---
-    # This turns the solver from "Feasible" to "Optimal".
+    # =========================================================================
+    # --- OPTIMIZATION (THE SOFT CONSTRAINTS) ---
+    # =========================================================================
     objective_terms = []
+
+    # 1. Reward Room Stability (Reward = -2)
     for cohort_id, classes in cohort_classes.items():
+        if "Open Electives" in cohort_id: continue
         for d in range(num_days):
-            active_slots = []
-            for t in range(num_slots):
-                slot_vars = [x[(c.id, r.id, d, t)] for c in classes for r in data.rooms if (c.id, r.id, d, t) in x]
-                if slot_vars:
-                    active_t = model.NewBoolVar(f'act_coh_{cohort_id}_d{d}_t{t}')
-                    model.Add(active_t == sum(slot_vars))
-                    active_slots.append(active_t)
-                else:
-                    active_slots.append(0)
-
-            # Check middle slots (1, 2, 3) to see if they are a gap
-            for t in range(1, num_slots - 1):
-                if active_slots[t] is not 0:
-                    gap_t = model.NewBoolVar(f'gap_{cohort_id}_d{d}_t{t}')
+            for t in range(num_slots - 1):
+                for r in data.rooms:
+                    room_t1 = [x[(c.id, r.id, d, t)] for c in classes if (c.id, r.id, d, t) in x]
+                    room_t2 = [x[(c.id, r.id, d, t+1)] for c in classes if (c.id, r.id, d, t+1) in x]
                     
-                    has_before = model.NewBoolVar(f'bef_{cohort_id}_d{d}_t{t}')
-                    prior = [a for a in active_slots[:t] if a is not 0]
-                    if prior: model.AddMaxEquality(has_before, prior)
-                    else: model.Add(has_before == 0)
-                        
-                    has_after = model.NewBoolVar(f'aft_{cohort_id}_d{d}_t{t}')
-                    after = [a for a in active_slots[t+1:] if a is not 0]
-                    if after: model.AddMaxEquality(has_after, after)
-                    else: model.Add(has_after == 0)
-                        
-                    # If class before AND class after AND NO class right now -> It's a gap!
-                    model.AddBoolOr([has_before.Not(), has_after.Not(), active_slots[t], gap_t])
-                    objective_terms.append(gap_t)
+                    if room_t1 and room_t2:
+                        stayed_in_room = model.NewBoolVar(f'stay_{cohort_id}_r{r.id}_d{d}_t{t}')
+                        model.Add(sum(room_t1) + sum(room_t2) == 2).OnlyEnforceIf(stayed_in_room)
+                        objective_terms.append(stayed_in_room * -2)
 
-    # Tell the AI to minimize the number of Swiss Cheese gaps!
+    # 2. PROFESSOR FAIRNESS (Load Balancing "Bad Slots")
+    max_prof_penalty = model.NewIntVar(0, 100, 'max_prof_penalty')
+    
+    for prof_id, classes in prof_classes.items():
+        bad_assignments = []
+        for c in classes:
+            for r in data.rooms:
+                if (c.id, r.id, 0, 0) in x: bad_assignments.append(x[(c.id, r.id, 0, 0)]) # Mon Morning
+                if (c.id, r.id, 4, 4) in x: bad_assignments.append(x[(c.id, r.id, 4, 4)]) # Fri Evening
+        
+        if bad_assignments:
+            model.Add(sum(bad_assignments) <= max_prof_penalty)
+            
+    objective_terms.append(max_prof_penalty * 20)
+
+    # 3. AVOID SATURDAYS (Last Resort Penalty)
+    SATURDAY_INDEX = 5
+    SATURDAY_PENALTY = 1000
+    for c in data.classes:
+        for r in data.rooms:
+            for t in range(num_slots):
+                if (c.id, r.id, SATURDAY_INDEX, t) in x:
+                    objective_terms.append(x[(c.id, r.id, SATURDAY_INDEX, t)] * SATURDAY_PENALTY)
+
+    # --- APPLY ALL OBJECTIVES ---
     if objective_terms:
         model.Minimize(sum(objective_terms))
 
     # --- SOLVE THE PUZZLE ---
     solver = cp_model.CpSolver()
     solver.parameters.num_search_workers = 8 
-    # Because optimization takes longer than just finding a valid fit, we give it a generous 3 minutes.
-    # It will stop early if it finds the mathematically absolute perfect schedule!
-    solver.parameters.max_time_in_seconds = 180.0 
+    # Giving it 4 minutes, but it should solve much faster now without the gap equations!
+    solver.parameters.max_time_in_seconds = 240.0 
     
-    print(f"🧠 Brain is OPTIMIZING {len(data.classes)} classes across 8 CPU cores. This might take up to 3 minutes...")
+    print(f"🧠 Brain is OPTIMIZING {len(data.classes)} classes. Enforcing Student Overlaps, Professor Fairness, and AVOIDING Saturdays...")
     status = solver.Solve(model)
 
     if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
@@ -203,13 +211,15 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
         for c in data.classes:
             for r in data.rooms:
                 if c.requiresRoomType == r.roomType and c.cohortHeadcount <= r.capacity:
-                    for d in range(num_days):
-                        for t in range(num_slots):
-                            if solver.Value(x[(c.id, r.id, d, t)]) == 1:
-                                start_time, end_time = SLOTS[t]
-                                scheduled_classes.append(
-                                    ScheduledClass(classId=c.id, roomId=r.id, dayOfWeek=DAYS[d], startTime=start_time, endTime=end_time)
-                                )
+                    has_eq = all(req in r.equipment for req in c.requiredEquipment)
+                    if has_eq:
+                        for d in range(num_days):
+                            for t in range(num_slots):
+                                if (c.id, r.id, d, t) in x and solver.Value(x[(c.id, r.id, d, t)]) == 1:
+                                    start_time, end_time = SLOTS[t]
+                                    scheduled_classes.append(
+                                        ScheduledClass(classId=c.id, roomId=r.id, dayOfWeek=DAYS[d], startTime=start_time, endTime=end_time)
+                                    )
         
         return ScheduleResponse(
             success=True,
@@ -219,7 +229,7 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
     elif status == cp_model.UNKNOWN:
         return ScheduleResponse(
             success=False, scheduledClasses=[],
-            message="Scheduling Failed (Timeout): The AI couldn't find a solution in 3 minutes."
+            message="Scheduling Failed (Timeout): The AI couldn't find a solution in 4 minutes. Try removing soft constraints or increasing max_time."
         )
     else:
         return ScheduleResponse(

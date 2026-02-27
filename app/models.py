@@ -7,23 +7,28 @@ class Room(BaseModel):
     name: str
     capacity: int
     roomType: str
-    campusId: str    # 👈 NEW: So the AI knows which campus the room is on!
-    buildingId: str  # 👈 NEW: So the AI knows which building the room is in!
+    campusId: str    
+    buildingId: str  
+    equipment: List[str]  # What does this room have? (Macs, Hoods, Smartboards, etc.)
 
 class Professor(BaseModel):
     id: str
     name: str
     maxHoursPerWeek: float
     timePreference: str  
+    unavailableDays: List[str]  # Days they absolutely cannot teach
 
 class ClassBlock(BaseModel):
     id: str
     courseCode: str
     durationMinutes: int
     requiresRoomType: str
+    requiredEquipment: List[str]  # What does this class need to function?
+    componentType: str  # Is this a LECTURE, TD, or TP?
     professorId: Optional[str] = None
     cohortId: str  
-    cohortHeadcount: int # 👈 NEW: So the AI can check if they physically fit in the room!
+    cohortHeadcount: int 
+    studentIds: List[str] # 👈 NEW TIER 3: The exact individual students enrolled in this class!
 
 class ScheduleRequest(BaseModel):
     rooms: List[Room]
