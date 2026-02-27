@@ -7,12 +7,14 @@ class Room(BaseModel):
     name: str
     capacity: int
     roomType: str
+    campusId: str    # 👈 NEW: So the AI knows which campus the room is on!
+    buildingId: str  # 👈 NEW: So the AI knows which building the room is in!
 
 class Professor(BaseModel):
     id: str
     name: str
     maxHoursPerWeek: float
-    timePreference: str  # 👈 NEW: Tell the AI when the prof prefers to teach!
+    timePreference: str  
 
 class ClassBlock(BaseModel):
     id: str
@@ -20,7 +22,8 @@ class ClassBlock(BaseModel):
     durationMinutes: int
     requiresRoomType: str
     professorId: Optional[str] = None
-    cohortId: str  # The AI needs to know which students take this class!
+    cohortId: str  
+    cohortHeadcount: int # 👈 NEW: So the AI can check if they physically fit in the room!
 
 class ScheduleRequest(BaseModel):
     rooms: List[Room]
