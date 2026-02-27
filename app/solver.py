@@ -8,14 +8,22 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
     # --- DEFINE THE GRID ---
     DAYS = ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY']
     SLOTS = [
-        ("08:00", "09:30"),
-        ("10:00", "11:30"),
-        ("13:00", "14:30"),
-        ("15:00", "16:30"),
-        ("17:00", "18:30")
+        ("08:00", "09:30"), # Slot 0 (Morning)
+        ("10:00", "11:30"), # Slot 1 (Morning)
+        ("13:00", "14:30"), # Slot 2 (Afternoon)
+        ("15:00", "16:30"), # Slot 3 (Afternoon)
+        ("17:00", "18:30")  # Slot 4 (Evening)
     ]
     num_days = len(DAYS)
     num_slots = len(SLOTS)
+
+    # Map time preference strings to valid slot indices
+    PREF_SLOTS = {
+        'MORNING': [0, 1],
+        'AFTERNOON': [2, 3],
+        'EVENING': [4],
+        'NO_PREFERENCE': [0, 1, 2, 3, 4]
+    }
 
     # --- CREATE VARIABLES ---
     # x[c, r, d, t] becomes a massive matrix of booleans (True/False).
@@ -99,6 +107,48 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
                 if cohort_assignments_at_time:
                     model.AddAtMostOne(cohort_assignments_at_time)
 
+    # --- CONSTRAINT 5: Spaced Learning (Max 1 session per course per day for a cohort) ---
+    cohort_course_groups = {}
+    for c in data.classes:
+        if c.cohortId:
+            # Group by BOTH Cohort AND Course Code
+            key = (c.cohortId, c.courseCode)
+            if key not in cohort_course_groups:
+                cohort_course_groups[key] = []
+            cohort_course_groups[key].append(c)
+
+    for (cohort_id, course_code), classes in cohort_course_groups.items():
+        # We only need to spread them out if there are multiple sessions (e.g., LECTURE and TD)
+        if len(classes) > 1:
+            for d in range(num_days):
+                course_sessions_on_this_day = []
+                for c in classes:
+                    for r in data.rooms:
+                        if c.requiresRoomType == r.roomType:
+                            for t in range(num_slots):
+                                course_sessions_on_this_day.append(x[(c.id, r.id, d, t)])
+                
+                # A cohort can take AT MOST ONE session of this specific course per day
+                if course_sessions_on_this_day:
+                    model.AddAtMostOne(course_sessions_on_this_day)
+
+    # --- CONSTRAINT 6: Professor Time Preferences ---
+    # Create a quick lookup dictionary mapping prof IDs to their preferences
+    prof_prefs = {p.id: p.timePreference for p in data.professors}
+    
+    for c in data.classes:
+        if c.professorId and c.professorId in prof_prefs:
+            pref = prof_prefs[c.professorId]
+            valid_slots = PREF_SLOTS.get(pref, [0, 1, 2, 3, 4])
+            
+            for r in data.rooms:
+                if c.requiresRoomType == r.roomType:
+                    for d in range(num_days):
+                        for t in range(num_slots):
+                            # If this time slot is NOT in the professor's preferred slots, absolutely ban it!
+                            if t not in valid_slots:
+                                model.Add(x[(c.id, r.id, d, t)] == 0)
+
     # --- SOLVE THE PUZZLE ---
     solver = cp_model.CpSolver()
     
@@ -147,5 +197,5 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
         return ScheduleResponse(
             success=False,
             scheduledClasses=[],
-            message="Scheduling Failed (Infeasible): This schedule is mathematically impossible. You lack the room capacity for this many classes."
+            message="Scheduling Failed (Infeasible): This schedule is mathematically impossible. Check if a professor has too many classes for their restricted time preference."
         )

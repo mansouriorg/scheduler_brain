@@ -12,6 +12,7 @@ class Professor(BaseModel):
     id: str
     name: str
     maxHoursPerWeek: float
+    timePreference: str  # 👈 NEW: Tell the AI when the prof prefers to teach!
 
 class ClassBlock(BaseModel):
     id: str
@@ -19,7 +20,7 @@ class ClassBlock(BaseModel):
     durationMinutes: int
     requiresRoomType: str
     professorId: Optional[str] = None
-    cohortId: str  # 👈 NEW: The AI needs to know which students take this class!
+    cohortId: str  # The AI needs to know which students take this class!
 
 class ScheduleRequest(BaseModel):
     rooms: List[Room]
