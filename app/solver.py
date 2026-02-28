@@ -199,8 +199,9 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
     # --- SOLVE THE PUZZLE ---
     solver = cp_model.CpSolver()
     solver.parameters.num_search_workers = 8 
-    # Giving it 4 minutes, but it should solve much faster now without the gap equations!
-    solver.parameters.max_time_in_seconds = 240.0 
+    
+    # 🚨 INCREASED TIMER: Gave the AI a full 10 minutes (600 seconds)
+    solver.parameters.max_time_in_seconds = 600.0 
     
     print(f"🧠 Brain is OPTIMIZING {len(data.classes)} classes. Enforcing Student Overlaps, Professor Fairness, and AVOIDING Saturdays...")
     status = solver.Solve(model)
@@ -229,7 +230,7 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
     elif status == cp_model.UNKNOWN:
         return ScheduleResponse(
             success=False, scheduledClasses=[],
-            message="Scheduling Failed (Timeout): The AI couldn't find a solution in 4 minutes. Try removing soft constraints or increasing max_time."
+            message="Scheduling Failed (Timeout): The AI couldn't find a solution in 10 minutes. Try removing soft constraints or increasing max_time."
         )
     else:
         return ScheduleResponse(
