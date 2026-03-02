@@ -37,7 +37,7 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
 
     # --- CREATE VARIABLES & HIGH-SPEED CACHE ---
     x = {}
-    class_vars_by_time = {} # ⚡ Fast-lookup cache to stop the 10-minute timeout!
+    class_vars_by_time = {} # ⚡ Fast-lookup cache
 
     for c in data.classes:
         for r in data.rooms:
@@ -200,10 +200,10 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
     solver = cp_model.CpSolver()
     solver.parameters.num_search_workers = 8 
     
-    # AI still has 10 minutes to verify everything, but it will solve much faster!
-    solver.parameters.max_time_in_seconds = 600.0 
+    # 🚨 PUSHED TO 20 MINUTES (1200 SECONDS)
+    solver.parameters.max_time_in_seconds = 1200.0 
     
-    print(f"🧠 Brain is OPTIMIZING {len(data.classes)} classes. Enforcing Student Overlaps, Professor Fairness, and AVOIDING Saturdays...")
+    print(f"🧠 Brain is OPTIMIZING {len(data.classes)} classes. Using High-Speed Matrix caching + 20-Minute Timeout...")
     status = solver.Solve(model)
 
     if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
@@ -230,7 +230,7 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
     elif status == cp_model.UNKNOWN:
         return ScheduleResponse(
             success=False, scheduledClasses=[],
-            message="Scheduling Failed (Timeout): The AI couldn't find a solution in 10 minutes. Try removing soft constraints or increasing max_time."
+            message="Scheduling Failed (Timeout): The AI couldn't find a solution in 20 minutes. Try removing soft constraints or increasing max_time."
         )
     else:
         return ScheduleResponse(
