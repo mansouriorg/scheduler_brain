@@ -17,6 +17,7 @@ class Professor(BaseModel):
     maxHoursPerWeek: float
     timePreference: str  
     unavailableDays: List[str]  # Days they absolutely cannot teach
+    isStrictTimeRequirement: bool = False  # 🚨 THE FIX: Python now knows about strict demands!
 
 class ClassBlock(BaseModel):
     id: str
