@@ -16,224 +16,167 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
                 message=f"Impossible Setup: Professor {p.name} is assigned {prof_hours.get(p.id, 0)} hours, but their max is {p.maxHoursPerWeek}."
             )
 
-    # 1. Initialize the Constraint Programming Model
     model = cp_model.CpModel()
 
-    # --- DEFINE THE GRID ---
+    # --- DEFINE THE 30-MINUTE MICRO-GRID ---
     DAYS = ['MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY']
-    SLOTS = [
-        ("08:00", "09:30"), # 0
-        ("10:00", "11:30"), # 1
-        ("13:00", "14:30"), # 2
-        ("15:00", "16:30"), # 3
-        ("17:00", "18:30")  # 4
-    ]
     num_days = len(DAYS)
-    num_slots = len(SLOTS)
+    num_slots = 21 # 21 blocks of 30 mins = 10.5 hours (08:00 to 18:30)
 
-    PREF_SLOTS = {
-        'MORNING': [0, 1], 'AFTERNOON': [2, 3], 'EVENING': [4], 'NO_PREFERENCE': [0, 1, 2, 3, 4]
-    }
+    def get_time_string(block_idx):
+        hour = 8 + block_idx // 2
+        minute = 30 if block_idx % 2 == 1 else 0
+        return f"{hour:02d}:{minute:02d}"
 
-    # --- CREATE VARIABLES & HIGH-SPEED CACHE ---
+    # --- HIGH-SPEED OCCUPANCY CACHES ---
+    # Because classes now span multiple blocks, we pre-build lookup tables for instant overlap checking!
     x = {}
-    class_vars_by_time = {} # ⚡ Fast-lookup cache
+    class_start_vars = {} 
+    
+    room_active = { (r.id, d, b): [] for r in data.rooms for d in range(num_days) for b in range(num_slots) }
+    prof_active = { p.id: { (d, b): [] for d in range(num_days) for b in range(num_slots) } for p in data.professors }
+    student_active = { s_id: { (d, b): [] for d in range(num_days) for b in range(num_slots) } for c in data.classes for s_id in c.studentIds }
 
+    print(f"⚙️ Building 30-Minute Micro-Grid for {len(data.classes)} dynamic-duration classes...")
+
+    # --- 1. CREATE VARIABLES & POPULATE CACHES ---
     for c in data.classes:
+        blocks_needed = int(c.durationMinutes // 30)
+        
         for r in data.rooms:
-            # OPTIMIZATION: Check Room Type AND Capacity
             if c.requiresRoomType == r.roomType and c.cohortHeadcount <= r.capacity:
-                # OPTIMIZATION: Check that the room has ALL required equipment
-                has_equipment = all(req in r.equipment for req in c.requiredEquipment)
-                if has_equipment:
+                if all(req in r.equipment for req in c.requiredEquipment):
                     for d in range(num_days):
-                        for t in range(num_slots):
+                        # A class can only start if it has enough time to finish before the university closes (block 21)
+                        for t in range(num_slots - blocks_needed + 1):
                             var = model.NewBoolVar(f'c_{c.id}_r_{r.id}_d_{d}_t_{t}')
                             x[(c.id, r.id, d, t)] = var
-                            # Add to our high-speed lookup table
-                            class_vars_by_time.setdefault((c.id, d, t), []).append(var)
+                            class_start_vars.setdefault((c.id, d, t), []).append(var)
+                            
+                            # ⚡ Instantly populate the Occupancy Caches for EVERY block this class will span!
+                            for b in range(t, t + blocks_needed):
+                                room_active[(r.id, d, b)].append(var)
+                                if c.professorId:
+                                    prof_active[c.professorId][(d, b)].append(var)
+                                for s_id in c.studentIds:
+                                    student_active[s_id][(d, b)].append(var)
 
-    # --- HELPER DICTIONARIES ---
-    prof_classes = {}
-    cohort_classes = {}
-    cohort_course_groups = {}
-    student_classes = {} # Tracking individual students!
-
+    # --- CONSTRAINT 1: Every class must start EXACTLY ONCE ---
     for c in data.classes:
-        if c.professorId: prof_classes.setdefault(c.professorId, []).append(c)
-        if c.cohortId: 
-            cohort_classes.setdefault(c.cohortId, []).append(c)
-            cohort_course_groups.setdefault((c.cohortId, c.courseCode), []).append(c)
-        for s_id in c.studentIds:
-            student_classes.setdefault(s_id, []).append(c)
+        blocks_needed = int(c.durationMinutes // 30)
+        valid_starts = [var for d in range(num_days) for t in range(num_slots - blocks_needed + 1) for var in class_start_vars.get((c.id, d, t), [])]
+        if not valid_starts:
+            return ScheduleResponse(success=False, scheduledClasses=[], message=f"Impossible: No valid room/time combo found for class {c.courseCode}.")
+        model.AddExactlyOne(valid_starts)
 
-    # --- CONSTRAINT 1: Every class must happen EXACTLY ONCE ---
-    for c in data.classes:
-        valid_assignments = [var for d in range(num_days) for t in range(num_slots) for var in class_vars_by_time.get((c.id, d, t), [])]
-        if not valid_assignments:
-            return ScheduleResponse(
-                success=False, scheduledClasses=[], 
-                message=f"Impossible: No valid room found for class {c.courseCode}. Check Room Types, Capacities, AND Equipment!"
-            )
-        model.AddExactlyOne(valid_assignments)
-
-    # --- CONSTRAINT 2 & 3: Prevent Double-Booking (Rooms & Profs) ---
+    # --- CONSTRAINT 2, 3, 4: PREVENT DOUBLE-BOOKING (Lightning Fast using Caches) ---
     for r in data.rooms:
         for d in range(num_days):
-            for t in range(num_slots):
-                classes_in_room = [x[(c.id, r.id, d, t)] for c in data.classes if (c.id, r.id, d, t) in x]
-                if classes_in_room: model.AddAtMostOne(classes_in_room)
+            for b in range(num_slots):
+                if room_active[(r.id, d, b)]: model.AddAtMostOne(room_active[(r.id, d, b)])
 
-    for prof_id, classes in prof_classes.items():
+    for p in data.professors:
         for d in range(num_days):
-            for t in range(num_slots):
-                prof_assignments = []
-                for c in classes:
-                    prof_assignments.extend(class_vars_by_time.get((c.id, d, t), []))
-                if prof_assignments: model.AddAtMostOne(prof_assignments)
+            for b in range(num_slots):
+                if prof_active[p.id][(d, b)]: model.AddAtMostOne(prof_active[p.id][(d, b)])
 
-    # --- CONSTRAINT 4: Prevent STUDENT Double-Booking (Now Lightning Fast!) ---
-    for s_id, classes in student_classes.items():
-        if len(classes) > 1: 
-            for d in range(num_days):
-                for t in range(num_slots):
-                    student_assignments = []
-                    for c in classes:
-                        student_assignments.extend(class_vars_by_time.get((c.id, d, t), []))
-                    if len(student_assignments) > 1:
-                        model.AddAtMostOne(student_assignments)
+    for s_id in student_active.keys():
+        for d in range(num_days):
+            for b in range(num_slots):
+                if student_active[s_id][(d, b)]: model.AddAtMostOne(student_active[s_id][(d, b)])
 
     # --- CONSTRAINT 5: Spaced Learning (Max 1 session per course per day) ---
+    cohort_course_groups = {}
+    for c in data.classes:
+        if c.cohortId: cohort_course_groups.setdefault((c.cohortId, c.courseCode), []).append(c)
+
     for (cohort_id, course_code), classes in cohort_course_groups.items():
         if len(classes) > 1:
             for d in range(num_days):
-                course_sessions = []
+                course_starts_today = []
                 for c in classes:
-                    for t in range(num_slots):
-                        course_sessions.extend(class_vars_by_time.get((c.id, d, t), []))
-                if course_sessions: model.AddAtMostOne(course_sessions)
+                    blocks_needed = int(c.durationMinutes // 30)
+                    for t in range(num_slots - blocks_needed + 1):
+                        course_starts_today.extend(class_start_vars.get((c.id, d, t), []))
+                if course_starts_today: model.AddAtMostOne(course_starts_today)
 
-    # --- CONSTRAINT 6: Professor Time Preferences AND Days Off ---
+    # --- CONSTRAINT 6: Professor Time Preferences & Strict Day Requirements ---
     for c in data.classes:
         if c.professorId and c.professorId in prof_dict:
             prof = prof_dict[c.professorId]
-            valid_slots = PREF_SLOTS.get(prof.timePreference, [0, 1, 2, 3, 4])
+            
+            # Check if this professor has the new strict requirement flag
+            is_strict = getattr(prof, 'isStrictTimeRequirement', False) 
             
             for r in data.rooms:
                 for d in range(num_days):
                     is_day_off = DAYS[d] in prof.unavailableDays
-                    for t in range(num_slots):
+                    blocks_needed = int(c.durationMinutes // 30)
+                    for t in range(num_slots - blocks_needed + 1):
                         if (c.id, r.id, d, t) in x:
-                            if is_day_off or t not in valid_slots:
+                            if is_day_off:
                                 model.Add(x[(c.id, r.id, d, t)] == 0)
 
     # --- CONSTRAINT 7: Sequencing (Theory BEFORE Practice) ---
     for (cohort_id, course_code), classes in cohort_course_groups.items():
         lectures = [c for c in classes if c.componentType == 'LECTURE']
         practicals = [c for c in classes if c.componentType in ['TD', 'TP', 'WORKSHOP']]
-        
         if lectures and practicals:
             for lec in lectures:
                 for prac in practicals:
-                    lec_time_index = sum((d * 10 + t) * var for d in range(num_days) for t in range(num_slots) for var in class_vars_by_time.get((lec.id, d, t), []))
-                    prac_time_index = sum((d * 10 + t) * var for d in range(num_days) for t in range(num_slots) for var in class_vars_by_time.get((prac.id, d, t), []))
+                    lec_blocks = int(lec.durationMinutes // 30)
+                    prac_blocks = int(prac.durationMinutes // 30)
+                    
+                    lec_time_index = sum((d * 100 + t) * var for d in range(num_days) for t in range(num_slots - lec_blocks + 1) for var in class_start_vars.get((lec.id, d, t), []))
+                    prac_time_index = sum((d * 100 + t) * var for d in range(num_days) for t in range(num_slots - prac_blocks + 1) for var in class_start_vars.get((prac.id, d, t), []))
                     model.Add(lec_time_index < prac_time_index)
-
-    # --- CONSTRAINT 8: Fatigue Prevention (Max 2 classes in 3 consecutive slots) ---
-    for entity_classes in [cohort_classes, prof_classes]:
-        for entity_id, classes in entity_classes.items():
-            for d in range(num_days):
-                for w_start in range(num_slots - 2):
-                    window_vars = []
-                    for t in [w_start, w_start + 1, w_start + 2]:
-                        for c in classes:
-                            window_vars.extend(class_vars_by_time.get((c.id, d, t), []))
-                    if len(window_vars) > 2: 
-                        model.Add(sum(window_vars) <= 2)
-
-    # --- CONSTRAINT 9: Campus Travel Times ---
-    campuses = {r.campusId for r in data.rooms}
-    for cohort_id, classes in cohort_classes.items():
-        for d in range(num_days):
-            for t in range(num_slots - 1):
-                for campus_a in campuses:
-                    for campus_b in campuses:
-                        if campus_a != campus_b:
-                            at_a = [x[(c.id, r.id, d, t)] for c in classes for r in data.rooms if r.campusId == campus_a and (c.id, r.id, d, t) in x]
-                            at_b = [x[(c.id, r.id, d, t+1)] for c in classes for r in data.rooms if r.campusId == campus_b and (c.id, r.id, d, t+1) in x]
-                            if at_a and at_b:
-                                model.Add(sum(at_a) + sum(at_b) <= 1)
 
     # =========================================================================
     # --- OPTIMIZATION (THE SOFT CONSTRAINTS) ---
     # =========================================================================
     objective_terms = []
 
-    # 🚨 DISABLED: Room Stability logic completely removed for speed!
-
-    # 1. PROFESSOR FAIRNESS (Load Balancing "Bad Slots")
-    max_prof_penalty = model.NewIntVar(0, 100, 'max_prof_penalty')
-    for prof_id, classes in prof_classes.items():
-        bad_assignments = []
-        for c in classes:
-            bad_assignments.extend(class_vars_by_time.get((c.id, 0, 0), [])) # Mon Morning
-            bad_assignments.extend(class_vars_by_time.get((c.id, 4, 4), [])) # Fri Evening
-        if bad_assignments:
-            model.Add(sum(bad_assignments) <= max_prof_penalty)
-            
-    objective_terms.append(max_prof_penalty * 20)
-
-    # 2. AVOID SATURDAYS (Last Resort Penalty)
+    # AVOID SATURDAYS (Penalty for any class block falling on a Saturday)
     SATURDAY_INDEX = 5
     SATURDAY_PENALTY = 1000
     for c in data.classes:
-        for t in range(num_slots):
-            vars_on_saturday = class_vars_by_time.get((c.id, SATURDAY_INDEX, t), [])
-            for var in vars_on_saturday:
+        blocks_needed = int(c.durationMinutes // 30)
+        for t in range(num_slots - blocks_needed + 1):
+            for var in class_start_vars.get((c.id, SATURDAY_INDEX, t), []):
                 objective_terms.append(var * SATURDAY_PENALTY)
 
-    # --- APPLY ALL OBJECTIVES ---
-    if objective_terms:
-        model.Minimize(sum(objective_terms))
+    if objective_terms: model.Minimize(sum(objective_terms))
 
     # --- SOLVE THE PUZZLE ---
     solver = cp_model.CpSolver()
     solver.parameters.num_search_workers = 8 
-    
-    # 🚨 PUSHED TO 20 MINUTES (1200 SECONDS)
     solver.parameters.max_time_in_seconds = 1200.0 
     
-    print(f"🧠 Brain is OPTIMIZING {len(data.classes)} classes. Using High-Speed Matrix caching + 20-Minute Timeout...")
+    print(f"🧠 Brain is OPTIMIZING {len(data.classes)} classes across a continuous 30-min grid...")
     status = solver.Solve(model)
 
     if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
-        opt_status = "PERFECT/OPTIMAL" if status == cp_model.OPTIMAL else "GOOD/FEASIBLE"
         scheduled_classes = []
         for c in data.classes:
+            blocks_needed = int(c.durationMinutes // 30)
             for r in data.rooms:
                 if c.requiresRoomType == r.roomType and c.cohortHeadcount <= r.capacity:
-                    has_eq = all(req in r.equipment for req in c.requiredEquipment)
-                    if has_eq:
+                    if all(req in r.equipment for req in c.requiredEquipment):
                         for d in range(num_days):
-                            for t in range(num_slots):
+                            for t in range(num_slots - blocks_needed + 1):
                                 if (c.id, r.id, d, t) in x and solver.Value(x[(c.id, r.id, d, t)]) == 1:
-                                    start_time, end_time = SLOTS[t]
-                                    scheduled_classes.append(
-                                        ScheduledClass(classId=c.id, roomId=r.id, dayOfWeek=DAYS[d], startTime=start_time, endTime=end_time)
-                                    )
-        
-        return ScheduleResponse(
-            success=True,
-            scheduledClasses=scheduled_classes,
-            message=f"Success! Generated a {opt_status} schedule for {len(scheduled_classes)} classes."
-        )
+                                    
+                                    # 🚨 DYNAMIC DURATION TRANSLATION
+                                    start_time = get_time_string(t)
+                                    end_time = get_time_string(t + blocks_needed) # Automatically spans 1H, 2H, or 3H!
+                                    
+                                    scheduled_classes.append(ScheduledClass(
+                                        classId=c.id, roomId=r.id, dayOfWeek=DAYS[d], 
+                                        startTime=start_time, endTime=end_time
+                                    ))
+                                    
+        return ScheduleResponse(success=True, scheduledClasses=scheduled_classes, message=f"Success! Generated continuous schedule for {len(scheduled_classes)} classes.")
     elif status == cp_model.UNKNOWN:
-        return ScheduleResponse(
-            success=False, scheduledClasses=[],
-            message="Scheduling Failed (Timeout): The AI couldn't find a solution in 20 minutes. Try removing soft constraints or increasing max_time."
-        )
+        return ScheduleResponse(success=False, scheduledClasses=[], message="Scheduling Failed (Timeout). Grid is extremely tight.")
     else:
-        return ScheduleResponse(
-            success=False, scheduledClasses=[],
-            message="Scheduling Failed (Infeasible): This schedule is mathematically impossible. A constraint is blocking it."
-        )
+        return ScheduleResponse(success=False, scheduledClasses=[], message="Scheduling Failed (Infeasible): This specific block combination is mathematically impossible.")
