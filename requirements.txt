@@ -1,0 +1,7 @@
+# Direct dependencies of scheduler-brain, pinned to the versions installed in venv/.
+# pip installs their own dependencies (numpy, pandas, protobuf, starlette, ...) automatically.
+# Python 3.13 is required (tested with 3.13.7).
+fastapi==0.129.2
+uvicorn==0.41.0
+pydantic==2.12.5
+ortools==9.15.6755
