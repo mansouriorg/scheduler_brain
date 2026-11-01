@@ -81,9 +81,10 @@ def a_class(
     }
 
 
-def a_fixed(class_id, day, start, end, room="amphi-a", prof_id=None, cohort="cohort-9", students=()):
-    """A class that is already in the timetable, as brain_server sends it."""
-    return {
+def a_fixed(class_id, day, start, end, room="amphi-a", prof_id=None, cohort="cohort-9", students=(), course=None):
+    """A class that is already in the timetable, as brain_server sends it (course:
+    its course code; brain_server sends it since update 43)."""
+    fixed = {
         "id": class_id,
         "roomId": room,
         "dayOfWeek": day,
@@ -94,6 +95,9 @@ def a_fixed(class_id, day, start, end, room="amphi-a", prof_id=None, cohort="coh
         "cohortId": cohort,
         "studentIds": list(students),
     }
+    if course is not None:
+        fixed["courseCode"] = course
+    return fixed
 
 
 def a_week_with_one_free_slot(**owner):
@@ -226,6 +230,10 @@ class DataShapeTests(unittest.TestCase):
 
         self.assertEqual(request.fixedClasses[0].roomId, "room-1")
         self.assertEqual(request.fixedClasses[0].studentIds, ["student-1"])
+        # Its course is read when it is sent, and None when it is not.
+        self.assertIsNone(request.fixedClasses[0].courseCode)
+        payload["fixedClasses"][0]["courseCode"] = "DEV-101"
+        self.assertEqual(ScheduleRequest.model_validate(payload).fixedClasses[0].courseCode, "DEV-101")
         # Without the field (an empty timetable), there are none.
         self.assertEqual(ScheduleRequest.model_validate({**payload, "fixedClasses": []}).fixedClasses, [])
         del payload["fixedClasses"]
@@ -427,6 +435,81 @@ class FixedClassTests(unittest.TestCase):
         self.assertEqual(
             result.message,
             "Impossible Setup: Professor Dr. prof-1 is assigned 12.0 hours, but their max is 11.0.",
+        )
+
+
+class FixedCourseDayTests(unittest.TestCase):
+    """A new part of a course for a cohort goes on another day than the parts of that
+    course for that cohort that are already in the timetable, unless a strict
+    teacher teaches the course."""
+
+    def place(self, fixed, course="DEV-101", cohort="cohort-1", strict=False):
+        teacher = a_professor("prof-1", max_hours=80.0)
+        teacher["isStrictTimeRequirement"] = strict
+        strict_lecturer = a_professor("prof-2", max_hours=80.0)
+        strict_lecturer["isStrictTimeRequirement"] = True
+        data = {
+            "rooms": [a_room("amphi-a", "AMPHI", 120, []), a_room("lab-304", "COMPUTER_LAB", 30, [])],
+            "professors": [teacher, strict_lecturer],
+            "classes": [a_class("td", course, "TD", 90, "COMPUTER_LAB", "prof-1", cohort=cohort)],
+            "fixedClasses": fixed,
+        }
+        return solve(data)
+
+    @staticmethod
+    def lectures(days, course="DEV-101", prof_id=None):
+        # The lecture of the course for cohort-1, in the timetable on each of these days.
+        return [
+            a_fixed(f"lecture-{day.lower()}", day, "08:30", "10:00", prof_id=prof_id, cohort="cohort-1", course=course)
+            for day in days
+        ]
+
+    def test_puts_the_new_part_on_a_day_without_a_part_of_its_course(self):
+        result = self.place(self.lectures(["MONDAY", "TUESDAY", "WEDNESDAY", "FRIDAY"]))
+
+        self.assertTrue(result.success, result.message)
+        self.assertEqual([p.dayOfWeek for p in result.scheduledClasses], ["THURSDAY"])
+
+    def test_lets_another_course_or_another_cohort_use_those_days(self):
+        every_day = self.lectures(DAYS)
+
+        self.assertTrue(self.place(every_day, course="DB-201").success)
+        self.assertTrue(self.place(every_day, cohort="cohort-2").success)
+
+    def test_lets_a_strict_teacher_teach_two_parts_on_one_day(self):
+        self.assertTrue(self.place(self.lectures(DAYS), strict=True).success)
+        # Also when the strict teacher teaches the part already in the timetable.
+        self.assertTrue(self.place(self.lectures(DAYS, prof_id="prof-2")).success)
+
+    def test_does_not_look_at_classes_sent_without_their_course(self):
+        self.assertTrue(self.place(self.lectures(DAYS, course=None)).success)
+
+    def test_says_so_when_no_day_is_left(self):
+        result = self.place(self.lectures(DAYS))
+
+        self.assertFalse(result.success)
+        self.assertEqual(
+            result.message,
+            "No day is left for DEV-101 TD: a class of DEV-101 for its cohort is already in the timetable on "
+            "Monday, Tuesday, Wednesday, Thursday, Friday and Saturday, and the parts of one course for one "
+            "cohort go on different days. Clear the timetable and generate it again to place all classes together.",
+        )
+
+    def test_also_names_the_classes_that_take_the_other_days(self):
+        # Saturday: cohort-1 follows another course all day.
+        fixed = self.lectures(["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"])
+        fixed.append(a_fixed("other", "SATURDAY", "08:00", "18:30", cohort="cohort-1", course="NET-301"))
+
+        result = self.place(fixed)
+
+        self.assertFalse(result.success)
+        self.assertEqual(
+            result.message,
+            "No day is left for DEV-101 TD: a class of DEV-101 for its cohort is already in the timetable on "
+            "Monday, Tuesday, Wednesday, Thursday and Friday, and the parts of one course for one cohort go on "
+            "different days (on the other days, the classes already in the timetable use every room it fits in, "
+            "or its teacher, cohort or students). Clear the timetable and generate it again to place all classes "
+            "together.",
         )
 
 

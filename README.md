@@ -37,7 +37,9 @@ Use the port that brain_server calls: `SOLVER_URL` in the `.env` of brain_server
 - `ScheduleRequest`: `rooms`, `professors`, `classes` (the classes to place), and
   `fixedClasses`: the classes already in the timetable, with their room, day and
   time. They stay where they are; the new classes are placed around them. It may
-  be left out (an empty timetable).
+  be left out (an empty timetable). Each may have its `courseCode`: a new part of
+  that course for the same cohort then goes on another day (left out: this rule
+  does not look at that class).
 - Each professor may have `unavailableTimes`: the times each week when they cannot
   teach (`dayOfWeek`, `startTime`, `endTime`, "HH:mm"). Their classes stay out of
   those times; a class that may end at 10:00 can still take place before a time off
@@ -90,7 +92,9 @@ run the real OR-Tools solver on small made-up weeks and check that:
 - the classes already in the timetable keep their place: new classes avoid their
   rooms, professors, cohorts and students, their hours count for the professors,
   and a class with no room and time left gets a clear message;
-- the parts of one course for one cohort fall on different days;
+- the parts of one course for one cohort fall on different days, also next to the
+  parts already in the timetable (unless a strict teacher teaches the course), and a
+  class with no day left gets a clear message;
 - a class goes in the part of the day its teacher prefers when it can (times off
   still come first), and a class that cannot is named in `outsidePreference`;
 - a class goes on Saturday only when Monday to Friday have no time for it, even

@@ -118,6 +118,23 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
                     blocks.update((DAYS.index(u.dayOfWeek), b) for b in blocks_between(u.startTime, u.endTime))
     kept_away = set()  # classes that lost some time to their teacher's times off
 
+    # --- THE PARTS OF ONE COURSE FOR ONE COHORT ON DIFFERENT DAYS (Constraint 5) ---
+    # Also with the classes already in the timetable: a new class does not go on a
+    # day on which a class of its course for its cohort is already in the
+    # timetable. Not for a course that a strict teacher teaches (as Constraint 5).
+    def is_strict(prof_id):
+        return prof_id in prof_dict and prof_dict[prof_id].isStrictTimeRequirement
+
+    strict_courses = {(c.cohortId, c.courseCode) for c in data.classes if is_strict(c.professorId)}
+    strict_courses |= {(f.cohortId, f.courseCode) for f in data.fixedClasses if is_strict(f.professorId)}
+    course_days = {}  # (cohort id, course code) -> days of its classes already in the timetable
+    if ENABLE_SPACED_LEARNING:
+        for f in data.fixedClasses:
+            key = (f.cohortId, f.courseCode)
+            if f.courseCode and f.dayOfWeek in DAYS and key not in strict_courses:
+                course_days.setdefault(key, set()).add(DAYS.index(f.dayOfWeek))
+    spaced_out = set()  # classes that lost some days to a class of their course already there
+
     # --- THE TIMES TEACHERS PREFER (a wish, not a rule) ---
     # The parts of the day of the Teachers page, in blocks of the grid (block 0
     # starts at 08:00): from the first block up to the end block. Their classes go
@@ -146,12 +163,16 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
         blocks_needed = int(c.durationMinutes // 30)
         busy = busy_times(c)
         off = away.get(c.professorId, set()) if c.professorId else set()
+        same_course = course_days.get((c.cohortId, c.courseCode), set())
         
         for r in data.rooms:
             if c.requiresRoomType == r.roomType and c.cohortHeadcount <= r.capacity:
                 if all(req in r.equipment for req in c.requiredEquipment):
                     room_busy = taken.get(("room", r.id), set())
                     for d in range(num_days):
+                        if d in same_course:
+                            spaced_out.add(c.id)
+                            continue
                         for t in range(num_slots - blocks_needed + 1):
                             if off and any((d, b) in off for b in range(t, t + blocks_needed)):
                                 kept_away.add(c.id)
@@ -186,6 +207,17 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
             return ScheduleResponse(
                 success=False, scheduledClasses=[],
                 message=f"No time is left for {c.courseCode} {c.componentType}: {name} cannot teach at any time it could take place{also}. Change the times off of {name} on the Teachers page, or choose another teacher for it."
+            )
+    # The same when, on every other day, a class of its course for its cohort is
+    # already in the timetable.
+    for c in data.classes:
+        if c.id in spaced_out and c.id not in placeable:
+            names = [DAYS[d].capitalize() for d in sorted(course_days[(c.cohortId, c.courseCode)])]
+            listed = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+            also = " (on the other days, the classes already in the timetable use every room it fits in, or its teacher, cohort or students)" if c.id in pushed_out else ""
+            return ScheduleResponse(
+                success=False, scheduledClasses=[],
+                message=f"No day is left for {c.courseCode} {c.componentType}: a class of {c.courseCode} for its cohort is already in the timetable on {listed}, and the parts of one course for one cohort go on different days{also}. Clear the timetable and generate it again to place all classes together."
             )
     for c in data.classes:
         if c.id in pushed_out and c.id not in placeable:

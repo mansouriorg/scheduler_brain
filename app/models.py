@@ -49,6 +49,9 @@ class FixedClass(BaseModel):
     durationMinutes: int
     professorId: Optional[str] = None
     cohortId: str
+    # Its course: the new parts of that course for the same cohort go on other
+    # days (None when it was not sent: then this rule does not look at it).
+    courseCode: Optional[str] = None
     studentIds: List[str] = []
 
 class ScheduleRequest(BaseModel):
