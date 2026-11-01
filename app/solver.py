@@ -9,6 +9,8 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
     ENABLE_SPACED_LEARNING = True       
     ENABLE_THEORY_BEFORE_PRACTICE = False  # 🚨 TURNED OFF for the 10-Second Test!
     ENABLE_PROF_UNAVAILABILITY = True
+    # How long to look for the times that teachers prefer, after the first timetable.
+    PREFERENCE_SEARCH_SECONDS = 30.0
     # =========================================================================
 
     # --- 1. PRE-FLIGHT SANITY CHECK (LOGGING) ---
@@ -113,6 +115,26 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
                 if u.dayOfWeek in DAYS:
                     blocks.update((DAYS.index(u.dayOfWeek), b) for b in blocks_between(u.startTime, u.endTime))
     kept_away = set()  # classes that lost some time to their teacher's times off
+
+    # --- THE TIMES TEACHERS PREFER (a wish, not a rule) ---
+    # The parts of the day of the Teachers page, in blocks of the grid (block 0
+    # starts at 08:00): from the first block up to the end block. Their classes go
+    # there when the timetable allows it (see the second search below).
+    PREFERRED_BLOCKS = {
+        "MORNING": (0, 8),  # 08:00 to 12:00
+        "AFTERNOON": (10, 18),  # 13:00 to 17:00
+        "EVENING": (18, num_slots),  # 17:00 to 18:30
+    }
+
+    def blocks_outside(c, t):
+        # How many 30-minute blocks of class c, when it starts at block t, are
+        # outside the part of the day its teacher prefers (0 without a wish).
+        prof = prof_dict.get(c.professorId) if c.professorId else None
+        wish = PREFERRED_BLOCKS.get(prof.timePreference) if prof else None
+        if wish is None:
+            return 0
+        first, end = wish
+        return sum(1 for b in range(t, t + int(c.durationMinutes // 30)) if b < first or b >= end)
 
     print("⚙️ [LOG] Building continuous Matrix and creating variables...")
     start_time_log = time.time()
@@ -300,8 +322,30 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
     print(f"🏁 [LOG] Solver finished in {round(solve_end - solve_start, 2)} seconds. Status Code: {status}")
 
     if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
+        # --- THE TIMES TEACHERS PREFER: a second, short search ---
+        # It starts from the first timetable (a hint) and looks for one with fewer
+        # 30-minute blocks outside the times teachers prefer, for at most
+        # PREFERENCE_SEARCH_SECONDS. Without a better one in time, the first stays.
+        best = solver
+        classes_by_id = {c.id: c for c in data.classes}
+        outside_cost = {key: blocks_outside(classes_by_id[key[0]], key[3]) for key in x}
+        cost_now = sum(outside_cost[key] for key, var in x.items() if solver.Value(var) == 1)
+        if cost_now > 0:
+            model.Minimize(sum(outside_cost[key] * var for key, var in x.items() if outside_cost[key] > 0))
+            for var in x.values():
+                model.AddHint(var, solver.Value(var))
+            better = cp_model.CpSolver()
+            better.parameters.num_search_workers = 8
+            better.parameters.max_time_in_seconds = PREFERENCE_SEARCH_SECONDS
+            print(f"[LOG] {cost_now} half hours are outside the times teachers prefer: looking for better times (at most {PREFERENCE_SEARCH_SECONDS:g} seconds)...")
+            better_status = better.Solve(model)
+            if better_status in (cp_model.OPTIMAL, cp_model.FEASIBLE) and better.ObjectiveValue() < cost_now:
+                best = better
+                cost_now = round(better.ObjectiveValue())
+            print(f"[LOG] {cost_now} half hours stay outside the times teachers prefer.")
         opt_status = "✅ WORKING/SURVIVAL" 
         scheduled_classes = []
+        outside = []  # the classes placed (partly) outside the time their teacher prefers
         for c in data.classes:
             blocks_needed = int(c.durationMinutes // 30)
             for r in data.rooms:
@@ -309,15 +353,17 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
                     if all(req in r.equipment for req in c.requiredEquipment):
                         for d in range(num_days):
                             for t in range(num_slots - blocks_needed + 1):
-                                if (c.id, r.id, d, t) in x and solver.Value(x[(c.id, r.id, d, t)]) == 1:
+                                if (c.id, r.id, d, t) in x and best.Value(x[(c.id, r.id, d, t)]) == 1:
                                     start_time = get_time_string(t)
                                     end_time = get_time_string(t + blocks_needed) 
                                     scheduled_classes.append(ScheduledClass(
                                         classId=c.id, roomId=r.id, dayOfWeek=DAYS[d], 
                                         startTime=start_time, endTime=end_time
                                     ))
+                                    if blocks_outside(c, t) > 0:
+                                        outside.append(c.id)
                                     
-        return ScheduleResponse(success=True, scheduledClasses=scheduled_classes, message=f"{opt_status} Schedule Generated! Placed {len(scheduled_classes)} dynamic classes.")
+        return ScheduleResponse(success=True, scheduledClasses=scheduled_classes, message=f"{opt_status} Schedule Generated! Placed {len(scheduled_classes)} dynamic classes.", outsidePreference=outside)
     
     elif status == cp_model.UNKNOWN:
         return ScheduleResponse(success=False, scheduledClasses=[], message="Scheduling Failed (Timeout). The AI got lost in the billions of combinations.")

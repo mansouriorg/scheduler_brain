@@ -21,7 +21,7 @@ class Professor(BaseModel):
     id: str
     name: str
     maxHoursPerWeek: float
-    timePreference: str  
+    timePreference: str  # MORNING, AFTERNOON, EVENING or NO_PREFERENCE: a wish, not a rule
     unavailableDays: List[str] = []  # Days they absolutely cannot teach
     unavailableTimes: List[TimeRange] = []  # Times each week they cannot teach
     isStrictTimeRequirement: bool = False  # 🚨 THE FIX: Python now knows about strict demands!
@@ -68,3 +68,6 @@ class ScheduleResponse(BaseModel):
     success: bool
     scheduledClasses: List[ScheduledClass]
     message: str = ""
+    # The classes placed (partly) outside the part of the day their teacher
+    # prefers: no better time was found for them.
+    outsidePreference: List[str] = []

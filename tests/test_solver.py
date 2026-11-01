@@ -430,6 +430,78 @@ class FixedClassTests(unittest.TestCase):
         )
 
 
+class PreferredTimeTests(unittest.TestCase):
+    """The part of the day a teacher prefers is a wish, not a rule: their classes go
+    there when the timetable allows it, and the answer names the ones that are not."""
+
+    def place(self, preference, length=90, times_off=()):
+        professor = a_professor("prof-1")
+        professor["timePreference"] = preference
+        professor["unavailableTimes"] = list(times_off)
+        data = {
+            "rooms": [a_room("amphi-a", "AMPHI", 120, [])],
+            "professors": [professor],
+            "classes": [a_class("new", "DEV-101", "LECTURE", length, "AMPHI", "prof-1")],
+        }
+        result = solve(data)
+        self.assertTrue(result.success, result.message)
+        [placed] = result.scheduledClasses
+        return placed, result.outsidePreference
+
+    def test_puts_the_class_of_a_morning_teacher_in_the_morning(self):
+        placed, outside = self.place("MORNING")
+        self.assertLessEqual(minutes(placed.endTime), 12 * 60)
+        self.assertEqual(outside, [])
+
+    def test_puts_the_class_of_an_afternoon_teacher_in_the_afternoon(self):
+        placed, outside = self.place("AFTERNOON")
+        self.assertGreaterEqual(minutes(placed.startTime), 13 * 60)
+        self.assertLessEqual(minutes(placed.endTime), 17 * 60)
+        self.assertEqual(outside, [])
+
+    def test_puts_the_class_of_an_evening_teacher_in_the_evening(self):
+        placed, outside = self.place("EVENING")
+        self.assertEqual((placed.startTime, placed.endTime), ("17:00", "18:30"))
+        self.assertEqual(outside, [])
+
+    def test_puts_a_class_too_long_for_the_evening_as_late_as_it_can_and_names_it(self):
+        # Three hours do not fit between 17:00 and 18:30: the class ends at 18:30.
+        placed, outside = self.place("EVENING", length=180)
+        self.assertEqual((placed.startTime, placed.endTime), ("15:30", "18:30"))
+        self.assertEqual(outside, ["new"])
+
+    def test_keeps_the_times_off_and_names_the_class(self):
+        mornings_off = [{"dayOfWeek": day, "startTime": "08:00", "endTime": "12:00"} for day in DAYS]
+        placed, outside = self.place("MORNING", times_off=mornings_off)
+        self.assertGreaterEqual(minutes(placed.startTime), 12 * 60)
+        self.assertEqual(outside, ["new"])
+
+    def test_names_no_class_of_a_teacher_without_a_preferred_time(self):
+        placed, outside = self.place("NO_PREFERENCE")
+        self.assertEqual(outside, [])
+
+    def test_keeps_every_rule_of_the_small_week(self):
+        week = {**SMALL_WEEK, "professors": [dict(p) for p in SMALL_WEEK["professors"]]}
+        week["professors"][1]["timePreference"] = "AFTERNOON"
+        result = solve(week)
+
+        self.assertTrue(result.success, result.message)
+        self.assertEqual(
+            sorted(p.classId for p in result.scheduledClasses),
+            sorted(c["id"] for c in SMALL_WEEK["classes"]),
+        )
+        self.assertEqual(result.outsidePreference, [])
+        days = {}
+        for p in result.scheduledClasses:
+            if p.classId in ("dev-td", "dev-tp"):
+                self.assertGreaterEqual(minutes(p.startTime), 13 * 60, p.classId)
+                self.assertLessEqual(minutes(p.endTime), 17 * 60, p.classId)
+            if p.classId.startswith("dev-"):
+                days[p.classId] = p.dayOfWeek
+        self.assertEqual(days["dev-lecture"], "WEDNESDAY")
+        self.assertEqual(len(set(days.values())), 3)
+
+
 class ImpossibleSetupTests(unittest.TestCase):
     def test_explains_when_a_professor_has_too_many_hours(self):
         data = {

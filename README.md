@@ -42,7 +42,15 @@ Use the port that brain_server calls: `SOLVER_URL` in the `.env` of brain_server
   teach (`dayOfWeek`, `startTime`, `endTime`, "HH:mm"). Their classes stay out of
   those times; a class that may end at 10:00 can still take place before a time off
   that starts at 10:00. `unavailableDays` (whole days) still works too.
-- `ScheduleResponse`: `success`, `scheduledClasses` (class, room, day, start, end), `message`.
+- Each professor has a `timePreference`: `MORNING` (08:00 to 12:00), `AFTERNOON`
+  (13:00 to 17:00), `EVENING` (17:00 to 18:30) or `NO_PREFERENCE`. It is a wish, not a
+  rule: after the first timetable, a second search of at most 30 seconds
+  (`PREFERENCE_SEARCH_SECONDS` in `app/solver.py`) moves classes into the preferred
+  part of the day where the rules allow it. Without a better timetable in time, the
+  first one stays.
+- `ScheduleResponse`: `success`, `scheduledClasses` (class, room, day, start, end),
+  `message`, and `outsidePreference`: the ids of the classes placed (partly) outside
+  the part of the day their teacher prefers.
 
 The exact fields are defined in `app/models.py`.
 
@@ -75,6 +83,8 @@ run the real OR-Tools solver on small made-up weeks and check that:
   rooms, professors, cohorts and students, their hours count for the professors,
   and a class with no room and time left gets a clear message;
 - the parts of one course for one cohort fall on different days;
+- a class goes in the part of the day its teacher prefers when it can (times off
+  still come first), and a class that cannot is named in `outsidePreference`;
 - impossible setups (too many hours, no room big enough, a week that is too
   short) get a clear message instead of a timetable.
 
