@@ -52,9 +52,13 @@ Use the port that brain_server calls: `SOLVER_URL` in the `.env` of brain_server
   when Monday to Friday have no time for it. This comes before the preferred times
   (a class goes on a weekday outside its teacher's preferred time rather than on
   Saturday).
+- It also puts the lecture of a course earlier in the week than its TD, TP and
+  workshop classes for the same cohort, when it can (among the classes placed in
+  that request). This comes after Saturday and before the preferred times.
 - `ScheduleResponse`: `success`, `scheduledClasses` (class, room, day, start, end),
-  `message`, and `outsidePreference`: the ids of the classes placed (partly) outside
-  the part of the day their teacher prefers.
+  `message`, `outsidePreference`: the ids of the classes placed (partly) outside
+  the part of the day their teacher prefers, and `beforeLecture`: the ids of the TD,
+  TP and workshop classes placed earlier in the week than a lecture of their course.
 
 The exact fields are defined in `app/models.py`.
 
@@ -91,6 +95,9 @@ run the real OR-Tools solver on small made-up weeks and check that:
   still come first), and a class that cannot is named in `outsidePreference`;
 - a class goes on Saturday only when Monday to Friday have no time for it, even
   if Saturday has its teacher's preferred time free;
+- the lecture of a course comes before its TD and TP in the week when it can (not
+  on Saturday, and before the preferred times), and the others are named in
+  `beforeLecture`;
 - impossible setups (too many hours, no room big enough, a week that is too
   short) get a clear message instead of a timetable.
 

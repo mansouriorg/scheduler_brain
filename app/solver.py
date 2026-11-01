@@ -10,7 +10,8 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
     ENABLE_THEORY_BEFORE_PRACTICE = False  # 🚨 TURNED OFF for the 10-Second Test!
     ENABLE_PROF_UNAVAILABILITY = True
     # How long the second search may look for a better timetable (fewer classes on
-    # Saturday, more classes at the times teachers prefer) after the first one.
+    # Saturday, lectures before their TD and TP, more classes at the times teachers
+    # prefer) after the first one.
     SECOND_SEARCH_SECONDS = 30.0
     # =========================================================================
 
@@ -323,36 +324,85 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
     print(f"🏁 [LOG] Solver finished in {round(solve_end - solve_start, 2)} seconds. Status Code: {status}")
 
     if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
-        # --- A SECOND, SHORT SEARCH: Saturday and the times teachers prefer ---
+        # --- A SECOND, SHORT SEARCH: Saturday, lectures first, preferred times ---
         # It starts from the first timetable (a hint) and looks for a better one for
         # at most SECOND_SEARCH_SECONDS; without a better one in time, the first
-        # stays. Each 30-minute block outside the time a teacher prefers costs 1, and
-        # a class on Saturday costs more than all of those together: Saturday is
-        # used only when Monday to Friday have no time for the class.
+        # stays. What it avoids, from the most to the least important:
+        #   1. a class on Saturday (used only when Monday to Friday have no time),
+        #   2. a TD, TP or workshop earlier in the week than a lecture of its course
+        #      for the same cohort (among the classes placed now),
+        #   3. each 30-minute block outside the time a teacher prefers.
+        # Each one costs more than all the ones below it together.
         best = solver
         classes_by_id = {c.id: c for c in data.classes}
-        saturday_cost = 1 + sum(int(c.durationMinutes // 30) for c in data.classes)
+        order_pairs = [
+            (lec, prac)
+            for group in cohort_course_groups.values()
+            for lec in group if lec.componentType == 'LECTURE'
+            for prac in group if prac.componentType in ('TD', 'TP', 'WORKSHOP')
+        ]
+        order_cost = 1 + sum(int(c.durationMinutes // 30) for c in data.classes)
+        saturday_cost = order_cost * (len(order_pairs) + 1)
         cost = {
             key: blocks_outside(classes_by_id[key[0]], key[3]) + (saturday_cost if key[2] == SATURDAY_INDEX else 0)
             for key in x
         }
-        cost_now = sum(cost[key] for key, var in x.items() if solver.Value(var) == 1)
-        if cost_now > 0:
-            model.Minimize(sum(cost[key] * var for key, var in x.items() if cost[key] > 0))
+
+        def starts_in(values):
+            # Where each class starts in the week (day * blocks per day + block).
+            return {key[0]: key[2] * num_slots + key[3] for key, var in x.items() if values.Value(var) == 1}
+
+        def costs_of(values):
+            # (classes on Saturday, TD/TP before their lecture, half hours outside).
+            starts = starts_in(values)
+            chosen = [key for key, var in x.items() if values.Value(var) == 1]
+            late = sum(1 for lec, prac in order_pairs if starts[prac.id] < starts[lec.id])
+            return (
+                sum(1 for key in chosen if key[2] == SATURDAY_INDEX),
+                late,
+                sum(blocks_outside(classes_by_id[key[0]], key[3]) for key in chosen),
+            )
+
+        def total(costs):
+            return costs[0] * saturday_cost + costs[1] * order_cost + costs[2]
+
+        costs_now = costs_of(solver)
+        if total(costs_now) > 0:
+            terms = [cost[key] * var for key, var in x.items() if cost[key] > 0]
+            if order_pairs:
+                # The start of each class of a pair, and for each pair a "late" switch
+                # that is on when its TD or TP comes first.
+                starts_now = starts_in(solver)
+                options = {}
+                for (cid, d, t), start_vars in class_start_vars.items():
+                    options.setdefault(cid, []).extend((d * num_slots + t, var) for var in start_vars)
+                start = {}
+                for c in {cls.id: cls for pair in order_pairs for cls in pair}.values():
+                    start[c.id] = model.NewIntVar(0, num_days * num_slots - 1, f"start_{c.id}")
+                    model.Add(start[c.id] == sum(k * var for k, var in options[c.id]))
+                    model.AddHint(start[c.id], starts_now[c.id])
+                for lec, prac in order_pairs:
+                    late = model.NewBoolVar(f"late_{lec.id}_{prac.id}")
+                    model.Add(start[prac.id] > start[lec.id]).OnlyEnforceIf(late.Not())
+                    model.AddHint(late, 1 if starts_now[prac.id] < starts_now[lec.id] else 0)
+                    terms.append(order_cost * late)
+            model.Minimize(sum(terms))
             for var in x.values():
                 model.AddHint(var, solver.Value(var))
             better = cp_model.CpSolver()
             better.parameters.num_search_workers = 8
             better.parameters.max_time_in_seconds = SECOND_SEARCH_SECONDS
-            print(f"[LOG] First timetable: {cost_now // saturday_cost} classes on Saturday, {cost_now % saturday_cost} half hours outside the times teachers prefer. Looking for a better one (at most {SECOND_SEARCH_SECONDS:g} seconds)...")
+            print(f"[LOG] First timetable: {costs_now[0]} classes on Saturday, {costs_now[1]} TD/TP before their lecture, {costs_now[2]} half hours outside the times teachers prefer. Looking for a better one (at most {SECOND_SEARCH_SECONDS:g} seconds)...")
             better_status = better.Solve(model)
-            if better_status in (cp_model.OPTIMAL, cp_model.FEASIBLE) and better.ObjectiveValue() < cost_now:
+            if better_status in (cp_model.OPTIMAL, cp_model.FEASIBLE) and total(costs_of(better)) < total(costs_now):
                 best = better
-                cost_now = round(better.ObjectiveValue())
-            print(f"[LOG] Now: {cost_now // saturday_cost} classes on Saturday, {cost_now % saturday_cost} half hours outside the times teachers prefer.")
+                costs_now = costs_of(better)
+            print(f"[LOG] Now: {costs_now[0]} classes on Saturday, {costs_now[1]} TD/TP before their lecture, {costs_now[2]} half hours outside the times teachers prefer.")
         opt_status = "✅ WORKING/SURVIVAL" 
         scheduled_classes = []
         outside = []  # the classes placed (partly) outside the time their teacher prefers
+        best_starts = starts_in(best)
+        before_lecture = sorted({prac.id for lec, prac in order_pairs if best_starts[prac.id] < best_starts[lec.id]})
         for c in data.classes:
             blocks_needed = int(c.durationMinutes // 30)
             for r in data.rooms:
@@ -370,7 +420,7 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
                                     if blocks_outside(c, t) > 0:
                                         outside.append(c.id)
                                     
-        return ScheduleResponse(success=True, scheduledClasses=scheduled_classes, message=f"{opt_status} Schedule Generated! Placed {len(scheduled_classes)} dynamic classes.", outsidePreference=outside)
+        return ScheduleResponse(success=True, scheduledClasses=scheduled_classes, message=f"{opt_status} Schedule Generated! Placed {len(scheduled_classes)} dynamic classes.", outsidePreference=outside, beforeLecture=before_lecture)
     
     elif status == cp_model.UNKNOWN:
         return ScheduleResponse(success=False, scheduledClasses=[], message="Scheduling Failed (Timeout). The AI got lost in the billions of combinations.")

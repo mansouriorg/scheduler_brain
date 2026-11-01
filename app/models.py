@@ -71,3 +71,6 @@ class ScheduleResponse(BaseModel):
     # The classes placed (partly) outside the part of the day their teacher
     # prefers: no better time was found for them.
     outsidePreference: List[str] = []
+    # The TD, TP and workshop classes placed earlier in the week than a lecture of
+    # their course for the same cohort: no better time was found for them.
+    beforeLecture: List[str] = []

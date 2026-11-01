@@ -545,6 +545,85 @@ class SaturdayTests(unittest.TestCase):
         self.assertEqual(outside, [])
 
 
+class LectureOrderTests(unittest.TestCase):
+    """The lecture of a course comes earlier in the week than its TD and TP (for the
+    same cohort) when the timetable allows it; the answer names the ones that do not.
+    It comes after Saturday and before the time of day a teacher prefers."""
+
+    def place(self, lecturer, practical_teacher):
+        data = {
+            "rooms": [
+                a_room("amphi-a", "AMPHI", 120, []),
+                a_room("lab-304", "COMPUTER_LAB", 30, ["COMPUTERS"]),
+            ],
+            "professors": [lecturer, practical_teacher],
+            # The TD and TP come first in the list, so a first timetable is likely to
+            # put them first in the week too.
+            "classes": [
+                a_class("td", "DEV-101", "TD", 90, "COMPUTER_LAB", practical_teacher["id"]),
+                a_class("tp", "DEV-101", "TP", 90, "COMPUTER_LAB", practical_teacher["id"]),
+                a_class("lecture", "DEV-101", "LECTURE", 90, "AMPHI", lecturer["id"]),
+            ],
+        }
+        result = solve(data)
+        self.assertTrue(result.success, result.message)
+        return {p.classId: p for p in result.scheduledClasses}, result
+
+    @staticmethod
+    def week_index(placed):
+        return DAYS.index(placed.dayOfWeek) * 24 * 60 + minutes(placed.startTime)
+
+    def test_puts_the_lecture_before_its_td_and_tp(self):
+        placed, result = self.place(a_professor("prof-1"), a_professor("prof-2"))
+
+        for part in ("td", "tp"):
+            self.assertLess(self.week_index(placed["lecture"]), self.week_index(placed[part]), part)
+        self.assertEqual(result.beforeLecture, [])
+
+    def test_names_a_td_that_cannot_come_after_its_lecture(self):
+        lecturer = a_professor("prof-1")
+        lecturer["unavailableTimes"] = a_week_off_but("FRIDAY", "08:00", "18:30")
+        practical_teacher = a_professor("prof-2")
+        practical_teacher["unavailableTimes"] = a_week_off_but("MONDAY", "08:00", "18:30")
+        practical_teacher["isStrictTimeRequirement"] = True  # TD and TP may share Monday
+        placed, result = self.place(lecturer, practical_teacher)
+
+        self.assertEqual(placed["lecture"].dayOfWeek, "FRIDAY")
+        self.assertEqual(result.beforeLecture, ["td", "tp"])
+
+    def test_keeps_saturday_free_before_it_puts_a_td_after_its_lecture(self):
+        # The TD and TP could go after the Friday lecture only on Saturday.
+        lecturer = a_professor("prof-1")
+        lecturer["unavailableTimes"] = a_week_off_but("FRIDAY", "08:00", "18:30")
+        practical_teacher = a_professor("prof-2", days_off=["WEDNESDAY", "THURSDAY", "FRIDAY"])
+        placed, result = self.place(lecturer, practical_teacher)
+
+        self.assertNotIn(placed["td"].dayOfWeek, ("FRIDAY", "SATURDAY"))
+        self.assertNotIn(placed["tp"].dayOfWeek, ("FRIDAY", "SATURDAY"))
+        self.assertEqual(result.beforeLecture, ["td", "tp"])
+
+    def test_puts_the_lecture_first_rather_than_at_the_preferred_time(self):
+        # The lecturer prefers mornings and is free on Monday afternoon and Wednesday
+        # morning; the TD and TP teacher only on Tuesday.
+        lecturer = a_professor("prof-1")
+        lecturer["timePreference"] = "MORNING"
+        lecturer["unavailableTimes"] = [
+            {"dayOfWeek": day, "startTime": "08:00", "endTime": "18:30"}
+            for day in DAYS
+            if day not in ("MONDAY", "WEDNESDAY")
+        ] + [
+            {"dayOfWeek": "MONDAY", "startTime": "08:00", "endTime": "12:00"},
+            {"dayOfWeek": "WEDNESDAY", "startTime": "12:00", "endTime": "18:30"},
+        ]
+        practical_teacher = a_professor("prof-2", days_off=["MONDAY", "WEDNESDAY", "THURSDAY", "FRIDAY", "SATURDAY"])
+        practical_teacher["isStrictTimeRequirement"] = True  # TD and TP may share Tuesday
+        placed, result = self.place(lecturer, practical_teacher)
+
+        self.assertEqual(placed["lecture"].dayOfWeek, "MONDAY")
+        self.assertEqual(result.beforeLecture, [])
+        self.assertEqual(result.outsidePreference, ["lecture"])
+
+
 class ImpossibleSetupTests(unittest.TestCase):
     def test_explains_when_a_professor_has_too_many_hours(self):
         data = {
