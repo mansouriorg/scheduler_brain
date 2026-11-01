@@ -34,7 +34,10 @@ Use the port that brain_server calls: `SOLVER_URL` in the `.env` of brain_server
 | GET    | `/`      | none             | status message   |
 | POST   | `/solve` | `ScheduleRequest` | `ScheduleResponse` |
 
-- `ScheduleRequest`: `rooms`, `professors`, `classes`.
+- `ScheduleRequest`: `rooms`, `professors`, `classes` (the classes to place), and
+  `fixedClasses`: the classes already in the timetable, with their room, day and
+  time. They stay where they are; the new classes are placed around them. It may
+  be left out (an empty timetable).
 - `ScheduleResponse`: `success`, `scheduledClasses` (class, room, day, start, end), `message`.
 
 The exact fields are defined in `app/models.py`.
@@ -62,6 +65,10 @@ run the real OR-Tools solver on small made-up weeks and check that:
   equipment, for its full length, between 08:00 and 18:30;
 - days off of professors are kept, and no room, professor or student is
   double-booked;
+- a cohort follows one class at a time, also without enrolled students;
+- the classes already in the timetable keep their place: new classes avoid their
+  rooms, professors, cohorts and students, their hours count for the professors,
+  and a class with no room and time left gets a clear message;
 - the parts of one course for one cohort fall on different days;
 - impossible setups (too many hours, no room big enough, a week that is too
   short) get a clear message instead of a timetable.

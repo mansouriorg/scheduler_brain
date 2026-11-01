@@ -31,10 +31,24 @@ class ClassBlock(BaseModel):
     cohortHeadcount: int 
     studentIds: List[str] # 👈 NEW TIER 3: The exact individual students enrolled in this class!
 
+class FixedClass(BaseModel):
+    # A class that is already in the timetable. It keeps its room, day and time;
+    # the new classes are placed around it.
+    id: str
+    roomId: str
+    dayOfWeek: str
+    startTime: str  # "HH:mm"
+    endTime: str
+    durationMinutes: int
+    professorId: Optional[str] = None
+    cohortId: str
+    studentIds: List[str] = []
+
 class ScheduleRequest(BaseModel):
     rooms: List[Room]
     professors: List[Professor]
     classes: List[ClassBlock]
+    fixedClasses: List[FixedClass] = []  # none when the timetable is empty
 
 class ScheduledClass(BaseModel):
     classId: str

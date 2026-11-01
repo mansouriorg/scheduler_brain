@@ -81,6 +81,31 @@ def a_class(
     }
 
 
+def a_fixed(class_id, day, start, end, room="amphi-a", prof_id=None, cohort="cohort-9", students=()):
+    """A class that is already in the timetable, as brain_server sends it."""
+    return {
+        "id": class_id,
+        "roomId": room,
+        "dayOfWeek": day,
+        "startTime": start,
+        "endTime": end,
+        "durationMinutes": minutes(end) - minutes(start),
+        "professorId": prof_id,
+        "cohortId": cohort,
+        "studentIds": list(students),
+    }
+
+
+def a_week_with_one_free_slot(**owner):
+    """Classes already in the timetable that keep one room, professor, cohort or
+    student busy all week, except on Friday from 14:00 to 15:30."""
+    full_days = ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "SATURDAY"]
+    week = [a_fixed(f"fixed-{day.lower()}", day, "08:00", "18:30", **owner) for day in full_days]
+    week.append(a_fixed("fixed-friday-morning", "FRIDAY", "08:00", "14:00", **owner))
+    week.append(a_fixed("fixed-friday-evening", "FRIDAY", "15:30", "18:30", **owner))
+    return week
+
+
 # A small week that has solutions: two rooms, two professors (prof-1 can only
 # teach on Wednesdays), cohort-1 with two courses, and two more cohorts whose
 # classes share nothing but the lecture hall.
@@ -164,6 +189,35 @@ class DataShapeTests(unittest.TestCase):
         self.assertEqual(len(request.classes), 2)
         self.assertIsNone(request.classes[1].professorId)
 
+    def test_accepts_the_classes_already_in_the_timetable(self):
+        payload = {
+            "rooms": [],
+            "professors": [],
+            "classes": [],
+            "fixedClasses": [
+                {
+                    "id": "class-9",
+                    "roomId": "room-1",
+                    "dayOfWeek": "MONDAY",
+                    "startTime": "08:30",
+                    "endTime": "10:00",
+                    "durationMinutes": 90,
+                    "professorId": "prof-1",
+                    "cohortId": "cohort-1",
+                    "studentIds": ["student-1"],
+                }
+            ],
+        }
+
+        request = ScheduleRequest.model_validate(payload)
+
+        self.assertEqual(request.fixedClasses[0].roomId, "room-1")
+        self.assertEqual(request.fixedClasses[0].studentIds, ["student-1"])
+        # Without the field (an empty timetable), there are none.
+        self.assertEqual(ScheduleRequest.model_validate({**payload, "fixedClasses": []}).fixedClasses, [])
+        del payload["fixedClasses"]
+        self.assertEqual(ScheduleRequest.model_validate(payload).fixedClasses, [])
+
     def test_answers_with_the_fields_brain_server_saves(self):
         self.assertEqual(
             set(ScheduledClass.model_fields),
@@ -226,6 +280,94 @@ class SolvableWeekTests(unittest.TestCase):
         days = [p.dayOfWeek for p in self.placed if self.classes[p.classId]["courseCode"] == "DEV-101"]
         self.assertEqual(len(days), 3)
         self.assertEqual(len(set(days)), 3)
+
+
+class CohortTests(unittest.TestCase):
+    def full_day_classes(self, count):
+        # Full-day classes of different courses for one cohort, without enrolled
+        # students: only the cohort rule keeps them on different days.
+        return {
+            "rooms": [a_room("amphi-a", "AMPHI", 120, []), a_room("amphi-b", "AMPHI", 120, [])],
+            "professors": [],
+            "classes": [
+                a_class(f"c{n}", f"COURSE-{n}", "LECTURE", 630, "AMPHI", None, students=())
+                for n in range(count)
+            ],
+        }
+
+    def test_never_puts_two_classes_of_one_cohort_at_the_same_time(self):
+        result = solve(self.full_day_classes(6))
+
+        self.assertTrue(result.success, result.message)
+        self.assertEqual(len({p.dayOfWeek for p in result.scheduledClasses}), 6)
+
+    def test_finds_no_timetable_when_the_cohort_would_need_two_places_at_once(self):
+        result = solve(self.full_day_classes(7))
+
+        self.assertFalse(result.success)
+        self.assertTrue(result.message.startswith("Scheduling Failed (Infeasible)"), result.message)
+
+
+class FixedClassTests(unittest.TestCase):
+    """Classes already in the timetable keep their place; new classes go around them."""
+
+    def place(self, fixed, prof_id=None, students=()):
+        data = {
+            "rooms": [a_room("amphi-a", "AMPHI", 120, []), a_room("lab-304", "COMPUTER_LAB", 30, [])],
+            # prof-1 may teach the whole week, so only the times can stop them.
+            "professors": [a_professor("prof-1", max_hours=80.0)],
+            "classes": [a_class("new", "DEV-101", "LECTURE", 90, "AMPHI", prof_id, students=students)],
+            "fixedClasses": fixed,
+        }
+        return solve(data)
+
+    def assert_in_the_free_slot(self, result):
+        self.assertTrue(result.success, result.message)
+        placed = [(p.classId, p.roomId, p.dayOfWeek, p.startTime, p.endTime) for p in result.scheduledClasses]
+        self.assertEqual(placed, [("new", "amphi-a", "FRIDAY", "14:00", "15:30")])
+
+    def test_keeps_new_classes_out_of_a_room_in_use(self):
+        self.assert_in_the_free_slot(self.place(a_week_with_one_free_slot(room="amphi-a")))
+
+    def test_keeps_a_professor_to_one_class_at_a_time(self):
+        fixed = a_week_with_one_free_slot(room="lab-304", prof_id="prof-1")
+        self.assert_in_the_free_slot(self.place(fixed, prof_id="prof-1"))
+
+    def test_keeps_a_cohort_to_one_class_at_a_time(self):
+        self.assert_in_the_free_slot(self.place(a_week_with_one_free_slot(room="lab-304", cohort="cohort-1")))
+
+    def test_keeps_a_student_to_one_class_at_a_time(self):
+        fixed = a_week_with_one_free_slot(room="lab-304", students=["student-1"])
+        self.assert_in_the_free_slot(self.place(fixed, students=("student-1", "student-2")))
+
+    def test_says_so_when_no_room_and_time_is_left(self):
+        fixed = [a_fixed(f"fixed-{day.lower()}", day, "08:00", "18:30") for day in DAYS]
+
+        result = self.place(fixed)
+
+        self.assertFalse(result.success)
+        self.assertEqual(
+            result.message,
+            "No room and time is left for DEV-101 LECTURE: at every time it could take place, the classes "
+            "already in the timetable use every room it fits in, or its teacher, cohort or students. "
+            "Clear the timetable and generate it again to place all classes together.",
+        )
+
+    def test_counts_the_hours_of_classes_already_in_the_timetable(self):
+        data = {
+            "rooms": [a_room("amphi-a", "AMPHI", 120, [])],
+            "professors": [a_professor("prof-1", max_hours=11.0)],
+            "classes": [a_class("new", "DEV-101", "LECTURE", 90, "AMPHI", "prof-1")],
+            "fixedClasses": [a_fixed("fixed", "MONDAY", "08:00", "18:30", room="lab-304", prof_id="prof-1")],
+        }
+
+        result = solve(data)
+
+        self.assertFalse(result.success)
+        self.assertEqual(
+            result.message,
+            "Impossible Setup: Professor Dr. prof-1 is assigned 12.0 hours, but their max is 11.0.",
+        )
 
 
 class ImpossibleSetupTests(unittest.TestCase):

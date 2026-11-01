@@ -32,6 +32,10 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
     for c in data.classes:
         if c.professorId:
             prof_hours[c.professorId] = prof_hours.get(c.professorId, 0) + (c.durationMinutes / 60.0)
+    # The classes already in the timetable count too: they take place every week.
+    for f in data.fixedClasses:
+        if f.professorId:
+            prof_hours[f.professorId] = prof_hours.get(f.professorId, 0) + (f.durationMinutes / 60.0)
 
     for p in data.professors:
         if prof_hours.get(p.id, 0) > p.maxHoursPerWeek:
@@ -59,6 +63,41 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
     room_active = { (r.id, d, b): [] for r in data.rooms for d in range(num_days) for b in range(num_slots) }
     prof_active = { p.id: { (d, b): [] for d in range(num_days) for b in range(num_slots) } for p in data.professors }
     student_active = { s_id: { (d, b): [] for d in range(num_days) for b in range(num_slots) } for c in data.classes for s_id in c.studentIds }
+    # A cohort follows one class at a time, also when no students are enrolled.
+    cohort_active = {}
+
+    # --- CLASSES ALREADY IN THE TIMETABLE (fixedClasses) ---
+    # They keep their room, day and time. The 30-minute blocks they use are
+    # taken: no new class may use the same room, teacher, cohort or student then.
+    def to_minutes(clock):
+        hours, minutes = clock.split(":")
+        return int(hours) * 60 + int(minutes)
+
+    def blocks_between(start, end):
+        # The blocks of the grid (block 0 starts at 08:00) from start to end.
+        first = (to_minutes(start) - 8 * 60) // 30
+        after = -(-(to_minutes(end) - 8 * 60) // 30)
+        return range(max(first, 0), min(after, num_slots))
+
+    taken = {}  # ("room" | "prof" | "cohort" | "student", id) -> {(day, block), ...}
+    for f in data.fixedClasses:
+        if f.dayOfWeek not in DAYS:
+            continue
+        d = DAYS.index(f.dayOfWeek)
+        owners = [("room", f.roomId), ("cohort", f.cohortId)] + [("student", s_id) for s_id in f.studentIds]
+        if f.professorId:
+            owners.append(("prof", f.professorId))
+        for owner in owners:
+            taken.setdefault(owner, set()).update((d, b) for b in blocks_between(f.startTime, f.endTime))
+
+    def busy_times(c):
+        # When the teacher, the cohort or a student of class c is already taken.
+        owners = [("cohort", c.cohortId)] + [("student", s_id) for s_id in c.studentIds]
+        if c.professorId:
+            owners.append(("prof", c.professorId))
+        return set().union(*(taken.get(owner, set()) for owner in owners))
+
+    pushed_out = set()  # classes that lost some room or time to the fixed classes
 
     print("⚙️ [LOG] Building continuous Matrix and creating variables...")
     start_time_log = time.time()
@@ -66,18 +105,24 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
     # --- CREATE VARIABLES & POPULATE CACHES ---
     for c in data.classes:
         blocks_needed = int(c.durationMinutes // 30)
+        busy = busy_times(c)
         
         for r in data.rooms:
             if c.requiresRoomType == r.roomType and c.cohortHeadcount <= r.capacity:
                 if all(req in r.equipment for req in c.requiredEquipment):
+                    room_busy = taken.get(("room", r.id), set())
                     for d in range(num_days):
                         for t in range(num_slots - blocks_needed + 1):
+                            if (busy or room_busy) and any((d, b) in busy or (d, b) in room_busy for b in range(t, t + blocks_needed)):
+                                pushed_out.add(c.id)
+                                continue
                             var = model.NewBoolVar(f'c_{c.id}_r_{r.id}_d_{d}_t_{t}')
                             x[(c.id, r.id, d, t)] = var
                             class_start_vars.setdefault((c.id, d, t), []).append(var)
                             
                             for b in range(t, t + blocks_needed):
                                 room_active[(r.id, d, b)].append(var)
+                                cohort_active.setdefault((c.cohortId, d, b), []).append(var)
                                 if c.professorId:
                                     prof_active[c.professorId][(d, b)].append(var)
                                 for s_id in c.studentIds:
@@ -87,6 +132,15 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
 
     print("⚙️ [LOG] Adding Constraint 1: Every class must start EXACTLY ONCE...")
     # --- CONSTRAINT 1: Every class must start EXACTLY ONCE ---
+    # A class whose every possible room and time is taken by the classes already
+    # in the timetable cannot be placed: say so plainly.
+    placeable = {key[0] for key in x}
+    for c in data.classes:
+        if c.id in pushed_out and c.id not in placeable:
+            return ScheduleResponse(
+                success=False, scheduledClasses=[],
+                message=f"No room and time is left for {c.courseCode} {c.componentType}: at every time it could take place, the classes already in the timetable use every room it fits in, or its teacher, cohort or students. Clear the timetable and generate it again to place all classes together."
+            )
     for c in data.classes:
         blocks_needed = int(c.durationMinutes // 30)
         valid_starts = [var for d in range(num_days) for t in range(num_slots - blocks_needed + 1) for var in class_start_vars.get((c.id, d, t), [])]
@@ -110,6 +164,9 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
         for d in range(num_days):
             for b in range(num_slots):
                 if student_active[s_id][(d, b)]: model.AddAtMostOne(student_active[s_id][(d, b)])
+
+    for cohort_vars in cohort_active.values():
+        model.AddAtMostOne(cohort_vars)
 
     cohort_course_groups = {}
     for c in data.classes:
