@@ -11,12 +11,19 @@ class Room(BaseModel):
     buildingId: str  
     equipment: List[str]  # What does this room have? (Macs, Hoods, Smartboards, etc.)
 
+class TimeRange(BaseModel):
+    # A time on one day of the week, "HH:mm" to "HH:mm".
+    dayOfWeek: str
+    startTime: str
+    endTime: str
+
 class Professor(BaseModel):
     id: str
     name: str
     maxHoursPerWeek: float
     timePreference: str  
-    unavailableDays: List[str]  # Days they absolutely cannot teach
+    unavailableDays: List[str] = []  # Days they absolutely cannot teach
+    unavailableTimes: List[TimeRange] = []  # Times each week they cannot teach
     isStrictTimeRequirement: bool = False  # 🚨 THE FIX: Python now knows about strict demands!
 
 class ClassBlock(BaseModel):

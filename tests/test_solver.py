@@ -106,6 +106,16 @@ def a_week_with_one_free_slot(**owner):
     return week
 
 
+def a_week_off_but(day, start, end):
+    """The times off of a teacher who can only teach on one day, from start to end."""
+    times = [{"dayOfWeek": d, "startTime": "08:00", "endTime": "18:30"} for d in DAYS if d != day]
+    if start != "08:00":
+        times.append({"dayOfWeek": day, "startTime": "08:00", "endTime": start})
+    if end != "18:30":
+        times.append({"dayOfWeek": day, "startTime": end, "endTime": "18:30"})
+    return times
+
+
 # A small week that has solutions: two rooms, two professors (prof-1 can only
 # teach on Wednesdays), cohort-1 with two courses, and two more cohorts whose
 # classes share nothing but the lecture hall.
@@ -151,7 +161,9 @@ class DataShapeTests(unittest.TestCase):
                     "maxHoursPerWeek": 12,
                     "timePreference": "MORNING",
                     "isStrictTimeRequirement": False,
-                    "unavailableDays": ["FRIDAY"],
+                    "unavailableTimes": [
+                        {"dayOfWeek": "FRIDAY", "startTime": "08:00", "endTime": "18:00"}
+                    ],
                 }
             ],
             "classes": [
@@ -185,7 +197,8 @@ class DataShapeTests(unittest.TestCase):
         request = ScheduleRequest.model_validate(payload)
 
         self.assertEqual(request.rooms[0].campusId, "campus-1")
-        self.assertEqual(request.professors[0].unavailableDays, ["FRIDAY"])
+        self.assertEqual(request.professors[0].unavailableTimes[0].dayOfWeek, "FRIDAY")
+        self.assertEqual(request.professors[0].unavailableDays, [])
         self.assertEqual(len(request.classes), 2)
         self.assertIsNone(request.classes[1].professorId)
 
@@ -306,6 +319,53 @@ class CohortTests(unittest.TestCase):
 
         self.assertFalse(result.success)
         self.assertTrue(result.message.startswith("Scheduling Failed (Infeasible)"), result.message)
+
+
+class TimesOffTests(unittest.TestCase):
+    """The classes of a teacher stay out of the times when that teacher cannot teach."""
+
+    def place(self, times_off, fixed=()):
+        professor = a_professor("prof-1", max_hours=80.0)
+        professor["unavailableTimes"] = times_off
+        data = {
+            "rooms": [a_room("amphi-a", "AMPHI", 120, [])],
+            "professors": [professor],
+            "classes": [a_class("new", "DEV-101", "LECTURE", 90, "AMPHI", "prof-1")],
+            "fixedClasses": list(fixed),
+        }
+        return solve(data)
+
+    def placed(self, result):
+        self.assertTrue(result.success, result.message)
+        return [(p.dayOfWeek, p.startTime, p.endTime) for p in result.scheduledClasses]
+
+    def test_places_a_class_only_when_its_teacher_can_teach(self):
+        result = self.place(a_week_off_but("TUESDAY", "14:00", "15:30"))
+        self.assertEqual(self.placed(result), [("TUESDAY", "14:00", "15:30")])
+
+    def test_a_class_may_end_when_a_time_off_starts(self):
+        # Free on Thursday from 08:00 to 09:30 only: the 90-minute class just fits.
+        result = self.place(a_week_off_but("THURSDAY", "08:00", "09:30"))
+        self.assertEqual(self.placed(result), [("THURSDAY", "08:00", "09:30")])
+
+    def test_says_so_when_the_teacher_can_never_teach_then(self):
+        # Free for one hour only: too short for the 90-minute class.
+        result = self.place(a_week_off_but("TUESDAY", "14:00", "15:00"))
+
+        self.assertFalse(result.success)
+        self.assertEqual(
+            result.message,
+            "No time is left for DEV-101 LECTURE: Dr. prof-1 cannot teach at any time it could take place. "
+            "Change the times off of Dr. prof-1 on the Teachers page, or choose another teacher for it.",
+        )
+
+    def test_also_names_the_classes_already_in_the_timetable(self):
+        fixed = [a_fixed("fixed-tuesday", "TUESDAY", "14:00", "15:30", room="amphi-a")]
+
+        result = self.place(a_week_off_but("TUESDAY", "14:00", "15:30"), fixed)
+
+        self.assertFalse(result.success)
+        self.assertIn("(the other times are taken by the classes already in the timetable)", result.message)
 
 
 class FixedClassTests(unittest.TestCase):

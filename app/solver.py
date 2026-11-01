@@ -99,6 +99,21 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
 
     pushed_out = set()  # classes that lost some room or time to the fixed classes
 
+    # --- WHEN TEACHERS CANNOT TEACH (Constraint 6) ---
+    # The blocks of their days off (unavailableDays) and of their times off
+    # (unavailableTimes): no class of theirs may use them.
+    away = {}  # teacher id -> {(day, block), ...}
+    if ENABLE_PROF_UNAVAILABILITY:
+        for p in data.professors:
+            blocks = away.setdefault(p.id, set())
+            for day in p.unavailableDays:
+                if day in DAYS:
+                    blocks.update((DAYS.index(day), b) for b in range(num_slots))
+            for u in p.unavailableTimes:
+                if u.dayOfWeek in DAYS:
+                    blocks.update((DAYS.index(u.dayOfWeek), b) for b in blocks_between(u.startTime, u.endTime))
+    kept_away = set()  # classes that lost some time to their teacher's times off
+
     print("⚙️ [LOG] Building continuous Matrix and creating variables...")
     start_time_log = time.time()
 
@@ -106,6 +121,7 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
     for c in data.classes:
         blocks_needed = int(c.durationMinutes // 30)
         busy = busy_times(c)
+        off = away.get(c.professorId, set()) if c.professorId else set()
         
         for r in data.rooms:
             if c.requiresRoomType == r.roomType and c.cohortHeadcount <= r.capacity:
@@ -113,6 +129,9 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
                     room_busy = taken.get(("room", r.id), set())
                     for d in range(num_days):
                         for t in range(num_slots - blocks_needed + 1):
+                            if off and any((d, b) in off for b in range(t, t + blocks_needed)):
+                                kept_away.add(c.id)
+                                continue
                             if (busy or room_busy) and any((d, b) in busy or (d, b) in room_busy for b in range(t, t + blocks_needed)):
                                 pushed_out.add(c.id)
                                 continue
@@ -135,6 +154,15 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
     # A class whose every possible room and time is taken by the classes already
     # in the timetable cannot be placed: say so plainly.
     placeable = {key[0] for key in x}
+    # The same when the teacher of the class cannot teach at any time left.
+    for c in data.classes:
+        if c.id in kept_away and c.id not in placeable:
+            name = prof_dict[c.professorId].name if c.professorId in prof_dict else "its teacher"
+            also = " (the other times are taken by the classes already in the timetable)" if c.id in pushed_out else ""
+            return ScheduleResponse(
+                success=False, scheduledClasses=[],
+                message=f"No time is left for {c.courseCode} {c.componentType}: {name} cannot teach at any time it could take place{also}. Change the times off of {name} on the Teachers page, or choose another teacher for it."
+            )
     for c in data.classes:
         if c.id in pushed_out and c.id not in placeable:
             return ScheduleResponse(
@@ -198,18 +226,8 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
 
     print(f"⚙️ [LOG] Adding Constraint 6: Professor Unavailability (Status: {ENABLE_PROF_UNAVAILABILITY})...")
     # --- CONSTRAINT 6: Professor Unavailability (TOGGLEABLE) ---
-    if ENABLE_PROF_UNAVAILABILITY:
-        for c in data.classes:
-            if c.professorId and c.professorId in prof_dict:
-                prof = prof_dict[c.professorId]
-                for r in data.rooms:
-                    for d in range(num_days):
-                        is_day_off = DAYS[d] in prof.unavailableDays
-                        blocks_needed = int(c.durationMinutes // 30)
-                        for t in range(num_slots - blocks_needed + 1):
-                            if (c.id, r.id, d, t) in x:
-                                if is_day_off:
-                                    model.Add(x[(c.id, r.id, d, t)] == 0)
+    # Done where the variables are made: a class of a teacher has no start at a
+    # time that teacher cannot teach (see "WHEN TEACHERS CANNOT TEACH" above).
 
     print(f"⚙️ [LOG] Adding Constraint 7: Theory BEFORE Practice (Status: {ENABLE_THEORY_BEFORE_PRACTICE})...")
     # --- CONSTRAINT 7: Theory BEFORE Practice (TOGGLEABLE) ---

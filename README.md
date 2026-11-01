@@ -38,6 +38,10 @@ Use the port that brain_server calls: `SOLVER_URL` in the `.env` of brain_server
   `fixedClasses`: the classes already in the timetable, with their room, day and
   time. They stay where they are; the new classes are placed around them. It may
   be left out (an empty timetable).
+- Each professor may have `unavailableTimes`: the times each week when they cannot
+  teach (`dayOfWeek`, `startTime`, `endTime`, "HH:mm"). Their classes stay out of
+  those times; a class that may end at 10:00 can still take place before a time off
+  that starts at 10:00. `unavailableDays` (whole days) still works too.
 - `ScheduleResponse`: `success`, `scheduledClasses` (class, room, day, start, end), `message`.
 
 The exact fields are defined in `app/models.py`.
@@ -63,7 +67,8 @@ run the real OR-Tools solver on small made-up weeks and check that:
   fields brain_server saves;
 - every class is placed exactly once, in a room of the right type, size and
   equipment, for its full length, between 08:00 and 18:30;
-- days off of professors are kept, and no room, professor or student is
+- days off and times off of professors are kept (a class with no time left
+  because of them gets a clear message), and no room, professor or student is
   double-booked;
 - a cohort follows one class at a time, also without enrolled students;
 - the classes already in the timetable keep their place: new classes avoid their
