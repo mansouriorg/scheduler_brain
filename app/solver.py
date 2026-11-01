@@ -9,8 +9,9 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
     ENABLE_SPACED_LEARNING = True       
     ENABLE_THEORY_BEFORE_PRACTICE = False  # 🚨 TURNED OFF for the 10-Second Test!
     ENABLE_PROF_UNAVAILABILITY = True
-    # How long to look for the times that teachers prefer, after the first timetable.
-    PREFERENCE_SEARCH_SECONDS = 30.0
+    # How long the second search may look for a better timetable (fewer classes on
+    # Saturday, more classes at the times teachers prefer) after the first one.
+    SECOND_SEARCH_SECONDS = 30.0
     # =========================================================================
 
     # --- 1. PRE-FLIGHT SANITY CHECK (LOGGING) ---
@@ -289,7 +290,7 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
             
     objective_terms.append(max_prof_penalty * 20)
 
-    # 2. AVOID SATURDAYS
+    # 2. AVOID SATURDAYS (done by the second search below; this term is not used)
     SATURDAY_INDEX = 5
     SATURDAY_PENALTY = 1000
     for c in data.classes:
@@ -322,27 +323,33 @@ def generate_schedule(data: ScheduleRequest) -> ScheduleResponse:
     print(f"🏁 [LOG] Solver finished in {round(solve_end - solve_start, 2)} seconds. Status Code: {status}")
 
     if status == cp_model.OPTIMAL or status == cp_model.FEASIBLE:
-        # --- THE TIMES TEACHERS PREFER: a second, short search ---
-        # It starts from the first timetable (a hint) and looks for one with fewer
-        # 30-minute blocks outside the times teachers prefer, for at most
-        # PREFERENCE_SEARCH_SECONDS. Without a better one in time, the first stays.
+        # --- A SECOND, SHORT SEARCH: Saturday and the times teachers prefer ---
+        # It starts from the first timetable (a hint) and looks for a better one for
+        # at most SECOND_SEARCH_SECONDS; without a better one in time, the first
+        # stays. Each 30-minute block outside the time a teacher prefers costs 1, and
+        # a class on Saturday costs more than all of those together: Saturday is
+        # used only when Monday to Friday have no time for the class.
         best = solver
         classes_by_id = {c.id: c for c in data.classes}
-        outside_cost = {key: blocks_outside(classes_by_id[key[0]], key[3]) for key in x}
-        cost_now = sum(outside_cost[key] for key, var in x.items() if solver.Value(var) == 1)
+        saturday_cost = 1 + sum(int(c.durationMinutes // 30) for c in data.classes)
+        cost = {
+            key: blocks_outside(classes_by_id[key[0]], key[3]) + (saturday_cost if key[2] == SATURDAY_INDEX else 0)
+            for key in x
+        }
+        cost_now = sum(cost[key] for key, var in x.items() if solver.Value(var) == 1)
         if cost_now > 0:
-            model.Minimize(sum(outside_cost[key] * var for key, var in x.items() if outside_cost[key] > 0))
+            model.Minimize(sum(cost[key] * var for key, var in x.items() if cost[key] > 0))
             for var in x.values():
                 model.AddHint(var, solver.Value(var))
             better = cp_model.CpSolver()
             better.parameters.num_search_workers = 8
-            better.parameters.max_time_in_seconds = PREFERENCE_SEARCH_SECONDS
-            print(f"[LOG] {cost_now} half hours are outside the times teachers prefer: looking for better times (at most {PREFERENCE_SEARCH_SECONDS:g} seconds)...")
+            better.parameters.max_time_in_seconds = SECOND_SEARCH_SECONDS
+            print(f"[LOG] First timetable: {cost_now // saturday_cost} classes on Saturday, {cost_now % saturday_cost} half hours outside the times teachers prefer. Looking for a better one (at most {SECOND_SEARCH_SECONDS:g} seconds)...")
             better_status = better.Solve(model)
             if better_status in (cp_model.OPTIMAL, cp_model.FEASIBLE) and better.ObjectiveValue() < cost_now:
                 best = better
                 cost_now = round(better.ObjectiveValue())
-            print(f"[LOG] {cost_now} half hours stay outside the times teachers prefer.")
+            print(f"[LOG] Now: {cost_now // saturday_cost} classes on Saturday, {cost_now % saturday_cost} half hours outside the times teachers prefer.")
         opt_status = "✅ WORKING/SURVIVAL" 
         scheduled_classes = []
         outside = []  # the classes placed (partly) outside the time their teacher prefers

@@ -502,6 +502,49 @@ class PreferredTimeTests(unittest.TestCase):
         self.assertEqual(len(set(days.values())), 3)
 
 
+class SaturdayTests(unittest.TestCase):
+    """Saturday is used only when Monday to Friday have no time for a class; it
+    comes before the time of day a teacher prefers."""
+
+    WEEKDAYS = DAYS[:5]
+
+    def place(self, fixed, preference="NO_PREFERENCE"):
+        professor = a_professor("prof-1")
+        professor["timePreference"] = preference
+        data = {
+            "rooms": [a_room("amphi-a", "AMPHI", 120, [])],
+            "professors": [professor],
+            "classes": [a_class("new", "DEV-101", "LECTURE", 90, "AMPHI", "prof-1")],
+            "fixedClasses": fixed,
+        }
+        result = solve(data)
+        self.assertTrue(result.success, result.message)
+        [placed] = result.scheduledClasses
+        return placed, result.outsidePreference
+
+    def test_keeps_the_classes_of_the_small_week_off_saturday(self):
+        result = solve(SMALL_WEEK)
+
+        self.assertTrue(result.success, result.message)
+        self.assertNotIn("SATURDAY", [p.dayOfWeek for p in result.scheduledClasses])
+
+    def test_puts_a_class_on_a_weekday_afternoon_rather_than_on_a_saturday_morning(self):
+        # The room is taken on weekday mornings; the teacher prefers mornings.
+        mornings = [a_fixed(f"fixed-{day.lower()}", day, "08:00", "12:00") for day in self.WEEKDAYS]
+        placed, outside = self.place(mornings, preference="MORNING")
+
+        self.assertIn(placed.dayOfWeek, self.WEEKDAYS)
+        self.assertGreaterEqual(minutes(placed.startTime), 12 * 60)
+        self.assertEqual(outside, ["new"])
+
+    def test_uses_saturday_when_the_week_has_no_room(self):
+        week = [a_fixed(f"fixed-{day.lower()}", day, "08:00", "18:30") for day in self.WEEKDAYS]
+        placed, outside = self.place(week)
+
+        self.assertEqual(placed.dayOfWeek, "SATURDAY")
+        self.assertEqual(outside, [])
+
+
 class ImpossibleSetupTests(unittest.TestCase):
     def test_explains_when_a_professor_has_too_many_hours(self):
         data = {

@@ -45,9 +45,13 @@ Use the port that brain_server calls: `SOLVER_URL` in the `.env` of brain_server
 - Each professor has a `timePreference`: `MORNING` (08:00 to 12:00), `AFTERNOON`
   (13:00 to 17:00), `EVENING` (17:00 to 18:30) or `NO_PREFERENCE`. It is a wish, not a
   rule: after the first timetable, a second search of at most 30 seconds
-  (`PREFERENCE_SEARCH_SECONDS` in `app/solver.py`) moves classes into the preferred
+  (`SECOND_SEARCH_SECONDS` in `app/solver.py`) moves classes into the preferred
   part of the day where the rules allow it. Without a better timetable in time, the
   first one stays.
+- The same second search keeps classes off Saturday: a class goes on Saturday only
+  when Monday to Friday have no time for it. This comes before the preferred times
+  (a class goes on a weekday outside its teacher's preferred time rather than on
+  Saturday).
 - `ScheduleResponse`: `success`, `scheduledClasses` (class, room, day, start, end),
   `message`, and `outsidePreference`: the ids of the classes placed (partly) outside
   the part of the day their teacher prefers.
@@ -85,6 +89,8 @@ run the real OR-Tools solver on small made-up weeks and check that:
 - the parts of one course for one cohort fall on different days;
 - a class goes in the part of the day its teacher prefers when it can (times off
   still come first), and a class that cannot is named in `outsidePreference`;
+- a class goes on Saturday only when Monday to Friday have no time for it, even
+  if Saturday has its teacher's preferred time free;
 - impossible setups (too many hours, no room big enough, a week that is too
   short) get a clear message instead of a timetable.
 
